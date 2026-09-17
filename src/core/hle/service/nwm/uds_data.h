@@ -5,6 +5,7 @@
 #pragma once
 
 #include <array>
+#include <optional>
 #include <span>
 #include <vector>
 #include "common/common_types.h"
@@ -14,6 +15,8 @@
 #include "core/hle/service/service.h"
 
 namespace Service::NWM {
+
+using DataCCMPKey = std::array<u8, 16>;
 
 enum class SAP : u8 { SNAPExtensionUsed = 0xAA };
 
@@ -171,5 +174,28 @@ std::vector<u8> GenerateEAPoLLogoffFrame(const MacAddress& mac_address, u16 netw
  * Returns a EAPoLLogoffPacket representing the specified 802.11-encapsulated data frame.
  */
 EAPoLLogoffPacket ParseEAPoLLogoffFrame(std::span<const u8> frame);
+
+/**
+ * Derives the CCMP key used by a physical UDS network. Unlike room multiplayer, a retail 3DS
+ * sends protected 802.11 data frames, so UDS Real must activate the crypto path that was already
+ * documented in this module.
+ */
+DataCCMPKey GenerateDataCCMPKey(std::span<const u8> passphrase,
+                                const NetworkInfo& network_info);
+
+/** Encrypts an 802.11 data payload and appends its eight-byte CCMP authentication tag. */
+std::vector<u8> EncryptDataFrame(std::span<const u8> payload, const DataCCMPKey& ccmp_key,
+                                 const MacAddress& sender, const MacAddress& receiver,
+                                 const MacAddress& bssid, u64 packet_number, u16 frame_control,
+                                 u16 sequence_control);
+
+/**
+ * Decrypts and authenticates an 802.11 CCMP payload. std::nullopt means that the frame failed its
+ * CCMP authentication check and must not be delivered to nwm::UDS.
+ */
+std::optional<std::vector<u8>> DecryptDataFrame(
+    std::span<const u8> encrypted_payload, const DataCCMPKey& ccmp_key, const MacAddress& sender,
+    const MacAddress& receiver, const MacAddress& bssid, u64 packet_number, u16 frame_control,
+    u16 sequence_control);
 
 } // namespace Service::NWM

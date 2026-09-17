@@ -12,6 +12,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <unordered_map>
 #include <vector>
 #include <boost/optional.hpp>
@@ -41,6 +42,11 @@ class DLP_SRVR;
 // Local-WLAN service
 
 namespace Service::NWM {
+
+namespace UdsReal {
+class Nl80211Monitor;
+struct CapturedFrame;
+}
 
 enum class ResultStatus {
     ResultSuccess = 0,
@@ -147,7 +153,7 @@ static_assert(sizeof(NetworkInfo) == 0x108, "NetworkInfo has incorrect size.");
 enum class TagId : u8 {
     SSID = 0,
     SupportedRates = 1,
-    DSParameterSet = 2,
+    DSParameterSet = 3,
     TrafficIndicationMap = 5,
     CountryInformation = 7,
     ERPInformation = 42,
@@ -245,6 +251,20 @@ private:
      *      2, 3: output buffer return descriptor & ptr
      */
     void RecvBeaconBroadcastData(Kernel::HLERequestContext& ctx);
+
+    /**
+     * NWM_UDS::SetProbeResponseParam service function.
+     * Stores the Nintendo OUI/type and the accompanying probe-response value.
+     * Azahar does not yet transmit physical probe responses, so accepting and
+     * recording these values is sufficient for the receive-only UDS Real path.
+     */
+    void SetProbeResponseParam(Kernel::HLERequestContext& ctx);
+
+    /**
+     * Undocumented command 0x23. Pokemon X calls this zero-argument command while changing PSS
+     * discovery modes. Hardware returns one u16 whose meaning is not yet documented.
+     */
+    void Unknown0x23(Kernel::HLERequestContext& ctx);
 
     /**
      * NWM_UDS::SetApplicationData service function.
@@ -565,6 +585,15 @@ private:
     /// Callback to parse and handle a received wifi packet.
     void OnWifiPacketReceived(const Network::WifiPacket& packet);
 
+    /// Bridges an emulated WifiPacket to room multiplayer and the physical UDS radio.
+    void SendPacket(Network::WifiPacket& packet);
+
+    /// Converts a captured physical 802.11 frame into the body format used by nwm::UDS.
+    void OnPhysicalFrameReceived(UdsReal::CapturedFrame frame);
+
+    /// Wraps an emulated UDS packet in a physical 802.11 management/data MPDU and queues it.
+    void SendPhysicalPacket(const Network::WifiPacket& packet);
+
     boost::optional<Network::MacAddress> GetNodeMacAddress(u16 dest_node_id, u8 flags);
 
     // Event that is signaled every time the connection status changes.
@@ -652,6 +681,28 @@ private:
 
     // List of the last <MaxBeaconFrames> beacons received from the network.
     std::list<Network::WifiPacket> received_beacons;
+
+    // Diagnostics for the experimental physical-beacon receive path.
+    std::size_t beacon_scan_request_count{};
+    std::size_t beacon_scan_nonempty_reply_count{};
+    std::size_t beacon_decrypt_request_count{};
+    bool beacon_decrypt_valid_seen{};
+    bool have_beacon_payload_fingerprint{};
+    u32 last_beacon_application_fingerprint{};
+    std::array<u8, 0x10> last_beacon_node_md5{};
+    std::size_t begin_hosting_request_count{};
+    std::size_t beacon_broadcast_callback_count{};
+    bool have_probe_response_param{};
+    u32 probe_response_oui_type{};
+    u32 probe_response_data{};
+
+    // Physical nl80211 monitor used by the experimental UDS Real backend.
+    std::unique_ptr<UdsReal::Nl80211Monitor> real_monitor;
+    std::optional<std::array<u8, 16>> physical_data_ccmp_key;
+    u64 physical_tx_packet_number{1};
+    u16 physical_tx_sequence_number{};
+    std::size_t physical_rx_frame_count{};
+    std::size_t physical_rx_ccmp_failure_count{};
 
     template <class Archive>
     void serialize(Archive& ar, const unsigned int);

@@ -402,6 +402,13 @@ add_library(citra_core STATIC EXCLUDE_FROM_ALL
     hle/service/nwm/nwm_tst.h
     hle/service/nwm/nwm_uds.cpp
     hle/service/nwm/nwm_uds.h
+    hle/service/nwm/uds_real/generic_netlink.cpp
+    hle/service/nwm/uds_real/generic_netlink.h
+    hle/service/nwm/uds_real/ldnd_connection.cpp
+    hle/service/nwm/uds_real/ldnd_connection.h
+    hle/service/nwm/uds_real/ldnd_protocol.h
+    hle/service/nwm/uds_real/nl80211_monitor.cpp
+    hle/service/nwm/uds_real/nl80211_monitor.h
     hle/service/nwm/uds_beacon.cpp
     hle/service/nwm/uds_beacon.h
     hle/service/nwm/uds_connection.cpp

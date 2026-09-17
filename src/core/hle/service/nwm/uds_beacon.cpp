@@ -4,6 +4,7 @@
 
 #define CRYPTOPP_ENABLE_NAMESPACE_WEAK 1
 
+#include <algorithm>
 #include <cstring>
 #include <cryptopp/aes.h>
 #include <cryptopp/md5.h>
@@ -24,16 +25,15 @@ constexpr u16 DefaultExtraCapabilities = 0x0431;
 // Size of the SSID broadcast by an UDS beacon frame.
 constexpr u8 UDSBeaconSSIDSize = 8;
 
-// The maximum size of the data stored in the EncryptedData0 tag (24).
-constexpr u32 EncryptedDataSizeCutoff = 0xFA;
-
 /**
  * NWM Beacon data encryption key, taken from the NWM module code.
- * We stub this with an all-zeros key as that is enough for Citra's purpose.
- * The real key can be used here to generate beacons that will be accepted by
- * a real 3ds.
+ * Required to decrypt node information from retail 3DS beacon tags and to
+ * generate beacons that a retail 3DS will accept.
  */
-constexpr std::array<u8, CryptoPP::AES::BLOCKSIZE> nwm_beacon_key = {};
+constexpr std::array<u8, CryptoPP::AES::BLOCKSIZE> nwm_beacon_key = {
+    0x26, 0xE4, 0x42, 0x3F, 0x4B, 0x3F, 0x69, 0xF2,
+    0xEE, 0x94, 0x19, 0x5B, 0x49, 0xFF, 0x69, 0x59,
+};
 
 /**
  * Generates a buffer with the fixed parameters of an 802.11 Beacon frame
@@ -56,10 +56,10 @@ std::vector<u8> GenerateFixedParameters() {
 }
 
 /**
- * Generates an SSID tag of an 802.11 Beacon frame with an 8-byte all-zero SSID value.
+ * Generates the 8-byte hexadecimal UDS network SSID tag of an 802.11 Beacon frame.
  * @returns A buffer with the SSID tag.
  */
-std::vector<u8> GenerateSSIDTag() {
+std::vector<u8> GenerateSSIDTag(const NetworkInfo& network_info) {
     std::vector<u8> buffer(sizeof(TagHeader) + UDSBeaconSSIDSize);
 
     TagHeader tag_header{};
@@ -68,7 +68,16 @@ std::vector<u8> GenerateSSIDTag() {
 
     std::memcpy(buffer.data(), &tag_header, sizeof(TagHeader));
 
-    // The rest of the buffer is already filled with zeros.
+    // A retail UDS host advertises its network id as an eight-character uppercase hexadecimal
+    // SSID. Clients use this SSID when they later join the selected network.
+    constexpr std::array<char, 16> HexDigits = {'0', '1', '2', '3', '4', '5', '6', '7',
+                                                '8', '9', 'A', 'B', 'C', 'D', 'E', 'F'};
+    const u32 network_id = network_info.network_id;
+    for (std::size_t index = 0; index < UDSBeaconSSIDSize; ++index) {
+        const std::size_t shift = (UDSBeaconSSIDSize - index - 1) * 4;
+        buffer[sizeof(TagHeader) + index] =
+            static_cast<u8>(HexDigits[(network_id >> shift) & 0xF]);
+    }
 
     return buffer;
 }
@@ -78,15 +87,37 @@ std::vector<u8> GenerateSSIDTag() {
  * such as SSID, Rate Information, Country Information, etc.
  * @returns A buffer with the tagged parameters of the beacon frame.
  */
-std::vector<u8> GenerateBasicTaggedParameters() {
+std::vector<u8> GenerateBasicTaggedParameters(const NetworkInfo& network_info) {
     // Append the SSID tag
-    std::vector<u8> buffer = GenerateSSIDTag();
+    std::vector<u8> buffer = GenerateSSIDTag(network_info);
 
-    // TODO(Subv): Add the SupportedRates tag.
-    // TODO(Subv): Add the DSParameterSet tag.
-    // TODO(Subv): Add the TrafficIndicationMap tag.
+    // Common 2.4 GHz supported rates: 1, 2, 5.5, 11, 6, 9, 12 and 18 Mbit/s.
+    constexpr std::array<u8, 8> SupportedRates{0x82, 0x84, 0x8B, 0x96,
+                                               0x0C, 0x12, 0x18, 0x24};
+    buffer.push_back(static_cast<u8>(TagId::SupportedRates));
+    buffer.push_back(static_cast<u8>(SupportedRates.size()));
+    buffer.insert(buffer.end(), SupportedRates.begin(), SupportedRates.end());
+
+    buffer.push_back(static_cast<u8>(TagId::DSParameterSet));
+    buffer.push_back(1);
+    buffer.push_back(network_info.channel);
+
+    // A minimal valid TIM for a network with no buffered unicast or multicast traffic.
+    constexpr std::array<u8, 4> TrafficIndicationMap{0, 1, 0, 0};
+    buffer.push_back(static_cast<u8>(TagId::TrafficIndicationMap));
+    buffer.push_back(static_cast<u8>(TrafficIndicationMap.size()));
+    buffer.insert(buffer.end(), TrafficIndicationMap.begin(), TrafficIndicationMap.end());
+
+    // ERP information and the remaining common OFDM rates.
+    buffer.push_back(static_cast<u8>(TagId::ERPInformation));
+    buffer.push_back(1);
+    buffer.push_back(0);
+    constexpr std::array<u8, 4> ExtendedRates{0x30, 0x48, 0x60, 0x6C};
+    buffer.push_back(50); // Extended Supported Rates.
+    buffer.push_back(static_cast<u8>(ExtendedRates.size()));
+    buffer.insert(buffer.end(), ExtendedRates.begin(), ExtendedRates.end());
+
     // TODO(Subv): Add the CountryInformation tag.
-    // TODO(Subv): Add the ERPInformation tag.
 
     return buffer;
 }
@@ -221,13 +252,23 @@ std::vector<u8> GeneratedEncryptedData(const NetworkInfo& network_info, const No
     return buffer;
 }
 
-void DecryptBeacon(const NetworkInfo& network_info, std::vector<u8>& buffer) {
+bool DecryptBeacon(const NetworkInfo& network_info, std::vector<u8>& buffer) {
     // Decrypt the data using AES-CTR and the NWM beacon key.
     using CryptoPP::AES;
     std::array<u8, AES::BLOCKSIZE> counter = GetBeaconCryptoCTR(network_info);
     CryptoPP::CTR_Mode<AES>::Decryption aes;
     aes.SetKeyWithIV(nwm_beacon_key.data(), AES::BLOCKSIZE, counter.data());
     aes.ProcessData(buffer.data(), buffer.data(), buffer.size());
+
+    if (buffer.size() < sizeof(BeaconData)) {
+        return false;
+    }
+
+    std::array<u8, CryptoPP::Weak::MD5::DIGESTSIZE> calculated_hash;
+    CryptoPP::Weak::MD5().CalculateDigest(
+        calculated_hash.data(), buffer.data() + offsetof(BeaconData, bitmask),
+        buffer.size() - offsetof(BeaconData, bitmask));
+    return std::equal(calculated_hash.begin(), calculated_hash.end(), buffer.begin());
 }
 
 /**
@@ -239,7 +280,8 @@ void DecryptBeacon(const NetworkInfo& network_info, std::vector<u8>& buffer) {
 std::vector<u8> GenerateNintendoFirstEncryptedDataTag(const NetworkInfo& network_info,
                                                       const NodeList& nodes) {
     const std::size_t payload_size = std::min<std::size_t>(
-        EncryptedDataSizeCutoff, nodes.size() * sizeof(BeaconNodeInfo) + sizeof(BeaconData));
+        EncryptedBeaconDataTagCapacity,
+        nodes.size() * sizeof(BeaconNodeInfo) + sizeof(BeaconData));
 
     const std::size_t tag_length = sizeof(EncryptedDataTag) - sizeof(TagHeader) + payload_size;
 
@@ -262,18 +304,20 @@ std::vector<u8> GenerateNintendoFirstEncryptedDataTag(const NetworkInfo& network
  * Generates a buffer with the Network Info Nintendo tag.
  * This tag contains the second portion of the encrypted payload in the 802.11 beacon frame.
  * The encrypted payload contains information about the nodes currently connected to the network.
- * This tag is only present if the payload size is greater than EncryptedDataSizeCutoff (0xFA)
+ * This tag is only present if the payload exceeds EncryptedBeaconDataTagCapacity (0xFA)
  * bytes.
  * @returns A buffer with the second Nintendo encrypted data parameters of the beacon frame.
  */
 std::vector<u8> GenerateNintendoSecondEncryptedDataTag(const NetworkInfo& network_info,
                                                        const NodeList& nodes) {
-    // This tag is only present if the payload is larger than EncryptedDataSizeCutoff (0xFA).
-    if (nodes.size() * sizeof(BeaconNodeInfo) + sizeof(BeaconData) <= EncryptedDataSizeCutoff)
+    // This tag is only present if the payload exceeds the first tag's 0xFA-byte capacity.
+    if (nodes.size() * sizeof(BeaconNodeInfo) + sizeof(BeaconData) <=
+        EncryptedBeaconDataTagCapacity)
         return {};
 
     const std::size_t payload_size =
-        (nodes.size() * sizeof(BeaconNodeInfo) + sizeof(BeaconData)) - EncryptedDataSizeCutoff;
+        (nodes.size() * sizeof(BeaconNodeInfo) + sizeof(BeaconData)) -
+        EncryptedBeaconDataTagCapacity;
 
     const std::size_t tag_length = sizeof(EncryptedDataTag) - sizeof(TagHeader) + payload_size;
 
@@ -290,8 +334,8 @@ std::vector<u8> GenerateNintendoSecondEncryptedDataTag(const NetworkInfo& networ
     std::memcpy(buffer.data(), &tag, sizeof(tag));
 
     std::vector<u8> encrypted_data = GeneratedEncryptedData(network_info, nodes);
-    std::memcpy(buffer.data() + sizeof(tag), encrypted_data.data() + EncryptedDataSizeCutoff,
-                payload_size);
+    std::memcpy(buffer.data() + sizeof(tag),
+                encrypted_data.data() + EncryptedBeaconDataTagCapacity, payload_size);
 
     return buffer;
 }
@@ -319,7 +363,7 @@ std::vector<u8> GenerateNintendoTaggedParameters(const NetworkInfo& network_info
 
 std::vector<u8> GenerateBeaconFrame(const NetworkInfo& network_info, const NodeList& nodes) {
     std::vector<u8> buffer = GenerateFixedParameters();
-    std::vector<u8> basic_tags = GenerateBasicTaggedParameters();
+    std::vector<u8> basic_tags = GenerateBasicTaggedParameters(network_info);
     std::vector<u8> nintendo_tags = GenerateNintendoTaggedParameters(network_info, nodes);
 
     buffer.insert(buffer.end(), basic_tags.begin(), basic_tags.end());

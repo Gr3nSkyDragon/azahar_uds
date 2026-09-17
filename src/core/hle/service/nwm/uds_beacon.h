@@ -15,6 +15,7 @@ namespace Service::NWM {
 
 using MacAddress = std::array<u8, 6>;
 constexpr std::array<u8, 3> NintendoOUI = {0x00, 0x1F, 0x32};
+constexpr std::size_t EncryptedBeaconDataTagCapacity = 0xFA;
 
 /**
  * Internal vendor-specific tag ids as stored inside
@@ -126,7 +127,7 @@ static_assert(sizeof(BeaconData) == 0x12, "BeaconData has incorrect size.");
 /**
  * Decrypts the beacon data buffer for the network described by `network_info`.
  */
-void DecryptBeacon(const NetworkInfo& network_info, std::vector<u8>& buffer);
+bool DecryptBeacon(const NetworkInfo& network_info, std::vector<u8>& buffer);
 
 /**
  * Generates an 802.11 beacon frame starting at the management frame header.
