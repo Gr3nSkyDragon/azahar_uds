@@ -1,3 +1,24 @@
+# Important!!!
+
+### Note from GSD:
+
+This fork and its primary unique feature(s) were coded using LLM generated material. Consequently, this fork is not associated with nor endorsed by Azahar or its primary contributors. It's provided as-is and is designed to be used in a Windows environment. 
+
+# How to run
+
+### Prerequisites
+You'll need to set up ldnd.exe from [unlimitedcoder2](https://gist.github.com/unlimitedcoder2/af2f09694563c6a6cd3d3e9ec45750bd). You'll need to follow the steps in that repository to set up your USB Wi-Fi adapter (you will need a compatible USB Wi-Fi adapter). I've been using a cheap/generic AC1300 adapter in my testing.
+
+If I haven't included an Azahar.exe in the releases, you'll need to build your own. This guide assumes you have the necessary hardware and can get ldnd.exe working on your own. 
+
+In order to trade with a retail 2/3DS, you should do the following:
+
+1) Begin searching for Passerby trainers in the PSS of your retail game before starting any programs on your computer
+2) Start ldnd.exe, then start Azahar
+3) Load into the Azahar game save, then select the retail trainer and request a trade
+
+This was written before testing in Sun/Moon/USUM and during testing of XY. Details may change for ORAS/gen7 once XY trading has been finished.
+
 ![Azahar Emulator](https://azahar-emu.org/resources/images/logo/azahar-name-and-logo.svg)
 
 ![Current Release](https://img.shields.io/github/v/release/azahar-emu/azahar?label=Current%20Release)
@@ -13,6 +34,7 @@
 The project continues the legacy of **Citra** and is actively developed by a community of contributors.
 
 *Azahar is not affiliated with or endorsed by Nintendo.*
+*This fork is not affiliated with or endorsed by Azahar or Nintendo.*
 
 # Installation
 
