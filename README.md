@@ -19,6 +19,8 @@ In order to trade with a retail 2/3DS, you should do the following:
 
 This was written before testing in Sun/Moon/USUM and during testing of XY. Details may change for ORAS/gen7 once XY trading has been finished.
 
+---
+
 ![Azahar Emulator](https://azahar-emu.org/resources/images/logo/azahar-name-and-logo.svg)
 
 ![Current Release](https://img.shields.io/github/v/release/azahar-emu/azahar?label=Current%20Release)
