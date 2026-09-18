@@ -3,8 +3,11 @@
 
 #include "core/hle/service/nwm/uds_real/ldnd_connection.h"
 
+#include <deque>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 
 #include "common/logging/log.h"
@@ -20,9 +23,120 @@ struct LdndConnection::Impl {
     HANDLE pipe = INVALID_HANDLE_VALUE;
 #endif
     u32 next_socket_id = 0;
+    std::unordered_map<u32, std::deque<std::vector<u8>>> pending_data;
+    std::size_t deferred_data_count{};
+    std::size_t raw_tx_pipe_trace_count{};
+
+    void QueueData(LdndFrame frame) {
+        pending_data[frame.socket_id].push_back(std::move(frame.blob));
+        ++deferred_data_count;
+    }
+
+    std::optional<std::vector<u8>> TakeData(u32 socket_id) {
+        const auto iterator = pending_data.find(socket_id);
+        if (iterator == pending_data.end() || iterator->second.empty()) {
+            return std::nullopt;
+        }
+        std::vector<u8> data = std::move(iterator->second.front());
+        iterator->second.pop_front();
+        if (iterator->second.empty()) {
+            pending_data.erase(iterator);
+        }
+        return data;
+    }
 };
 
 namespace {
+
+u16 ReadU16LittleEndian(const u8* input) {
+    return static_cast<u16>(input[0]) | (static_cast<u16>(input[1]) << 8);
+}
+
+u32 ReadU32LittleEndian(const u8* input) {
+    return static_cast<u32>(input[0]) | (static_cast<u32>(input[1]) << 8) |
+           (static_cast<u32>(input[2]) << 16) | (static_cast<u32>(input[3]) << 24);
+}
+
+u32 FingerprintBytes(std::span<const u8> bytes) {
+    u32 fingerprint = 2166136261U;
+    for (const u8 byte : bytes) {
+        fingerprint ^= byte;
+        fingerprint *= 16777619U;
+    }
+    return fingerprint;
+}
+
+std::string FormatHexBytes(std::span<const u8> bytes) {
+    constexpr char Hex[] = "0123456789ABCDEF";
+    std::string output;
+    output.reserve(bytes.size() * 3);
+    for (const u8 byte : bytes) {
+        if (!output.empty()) {
+            output.push_back(':');
+        }
+        output.push_back(Hex[byte >> 4]);
+        output.push_back(Hex[byte & 0xF]);
+    }
+    return output.empty() ? "<none>" : output;
+}
+
+void TraceProtectedSendToFrame(std::size_t& trace_count, const LdndFrame& frame,
+                               const LdndProtocol::Header& header) {
+    if (frame.op != LdndOp::SendTo || frame.blob.size() < 8 || frame.blob[0] != 0 ||
+        frame.blob[1] != 0) {
+        return;
+    }
+
+    const u16 radiotap_length = ReadU16LittleEndian(frame.blob.data() + 2);
+    if (radiotap_length < 8 ||
+        frame.blob.size() < static_cast<std::size_t>(radiotap_length) + 32) {
+        return;
+    }
+
+    const u8* mpdu = frame.blob.data() + radiotap_length;
+    const std::size_t mpdu_size = frame.blob.size() - radiotap_length;
+    const u16 frame_control = ReadU16LittleEndian(mpdu);
+    const u8 frame_type = static_cast<u8>((frame_control >> 2) & 0x3);
+    if (frame_type != 2 || (frame_control & 0x4000) == 0) {
+        return;
+    }
+
+    ++trace_count;
+    std::vector<u8> pipe_frame;
+    pipe_frame.reserve(header.size() + frame.blob.size());
+    pipe_frame.insert(pipe_frame.end(), header.begin(), header.end());
+    pipe_frame.insert(pipe_frame.end(), frame.blob.begin(), frame.blob.end());
+
+    const u32 radiotap_present = ReadU32LittleEndian(frame.blob.data() + 4);
+    const u16 radiotap_tx_flags =
+        radiotap_length >= 10 ? ReadU16LittleEndian(frame.blob.data() + 8) : 0;
+    const bool protocol_length_valid =
+        static_cast<std::size_t>(ReadU32LittleEndian(header.data() + 17)) == frame.blob.size();
+    const bool radiotap_length_valid =
+        radiotap_length == ((radiotap_tx_flags & 0x0008) != 0 ? 10 : 8);
+    const bool packet_length_valid = frame.blob.size() == radiotap_length + mpdu_size;
+    LOG_INFO(
+        Service_NWM,
+        "UDS LDND RAW TX PIPE #{}: writeSucceeded=true, protocolHeaderBytes={}, "
+        "protocolOp={}, socketIdLE={}, arg0FlagsLE={}, arg1LE={}, arg2LE={}, "
+        "blobLengthLE={}, blobLengthRaw={:02X}:{:02X}:{:02X}:{:02X}, "
+        "radiotapLengthLE={}, radiotapPresentLE=0x{:08X}, "
+        "radiotapTxFlagsLE=0x{:04X}, radiotapNoAck={}, mpduOffset={}, "
+        "mpduBytes={}, frameControlLE=0x{:04X}, "
+        "checks={{protocolLength:{},radiotapLength:{},packetLength:{}}}, "
+        "blobFingerprint=0x{:08X}, mpduFingerprint=0x{:08X}, "
+        "pipeFrameFingerprint=0x{:08X}, protocolHeader={}, blob={}, pipeFrame={}",
+        trace_count, header.size(), static_cast<u32>(frame.op),
+        ReadU32LittleEndian(header.data() + 1), ReadU32LittleEndian(header.data() + 5),
+        ReadU32LittleEndian(header.data() + 9), ReadU32LittleEndian(header.data() + 13),
+        ReadU32LittleEndian(header.data() + 17), header[17], header[18], header[19], header[20],
+        radiotap_length, radiotap_present, radiotap_tx_flags,
+        (radiotap_tx_flags & 0x0008) != 0, radiotap_length, mpdu_size, frame_control,
+        protocol_length_valid, radiotap_length_valid, packet_length_valid,
+        FingerprintBytes(frame.blob), FingerprintBytes(std::span<const u8>{mpdu, mpdu_size}),
+        FingerprintBytes(pipe_frame), FormatHexBytes(header), FormatHexBytes(frame.blob),
+        FormatHexBytes(pipe_frame));
+}
 
 #ifdef _WIN32
 [[noreturn]] void ThrowWindowsError(const char* operation) {
@@ -91,6 +205,10 @@ void LdndConnection::Connect(const std::wstring& pipe_path) {
         SetLastError(error);
         ThrowWindowsError("SetNamedPipeHandleState(ldnd)");
     }
+    impl->next_socket_id = 0;
+    impl->pending_data.clear();
+    impl->deferred_data_count = 0;
+    impl->raw_tx_pipe_trace_count = 0;
 #else
     (void)pipe_path;
     throw std::runtime_error("UDS Real ldnd transport is currently implemented only on Windows");
@@ -104,6 +222,9 @@ void LdndConnection::Disconnect() {
         impl->pipe = INVALID_HANDLE_VALUE;
     }
 #endif
+    if (impl) {
+        impl->pending_data.clear();
+    }
 }
 
 bool LdndConnection::IsConnected() const {
@@ -132,6 +253,10 @@ void LdndConnection::WriteFrame(const LdndFrame& frame) {
     if (!frame.blob.empty()) {
         WriteExactly(impl->pipe, frame.blob.data(), frame.blob.size());
     }
+
+    // Trace after both writes have succeeded. The helper is platform-neutral so its byte parsing
+    // and compile-time format checks can also be validated by non-Windows development builds.
+    TraceProtectedSendToFrame(impl->raw_tx_pipe_trace_count, frame, header);
 #else
     (void)frame;
     throw std::runtime_error("ldnd is unavailable on this platform");
@@ -156,13 +281,26 @@ LdndFrame LdndConnection::ReadFrame() {
 
 LdndFrame LdndConnection::SendRequest(const LdndFrame& frame) {
     WriteFrame(frame);
-    LdndFrame reply = ReadFrame();
-    if (reply.socket_id != frame.socket_id) {
-        throw std::runtime_error("ldnd reply SID mismatch: expected " +
-                                 std::to_string(frame.socket_id) + ", received " +
-                                 std::to_string(reply.socket_id));
+    for (;;) {
+        LdndFrame reply = ReadFrame();
+        if (reply.op == LdndOp::Data) {
+            const u32 data_socket_id = reply.socket_id;
+            impl->QueueData(std::move(reply));
+            if (impl->deferred_data_count <= 5 || impl->deferred_data_count % 100 == 0) {
+                LOG_INFO(Service_NWM,
+                         "UDS Real: ldnd deferred interleaved DATA #{} for SID={} while "
+                         "waiting for reply SID={}",
+                         impl->deferred_data_count, data_socket_id, frame.socket_id);
+            }
+            continue;
+        }
+        if (reply.socket_id != frame.socket_id) {
+            throw std::runtime_error("ldnd reply SID mismatch: expected " +
+                                     std::to_string(frame.socket_id) + ", received " +
+                                     std::to_string(reply.socket_id));
+        }
+        return reply;
     }
-    return reply;
 }
 
 void LdndConnection::ThrowIfDaemonError(const LdndFrame& reply, const char* operation) {
@@ -222,10 +360,17 @@ void LdndConnection::SendTo(u32 socket_id, std::span<const u8> data, int flags) 
 }
 
 std::vector<u8> LdndConnection::ReceiveData(u32 socket_id) {
+    if (auto pending = impl->TakeData(socket_id)) {
+        return std::move(*pending);
+    }
     for (;;) {
         LdndFrame frame = ReadFrame();
-        if (frame.op == LdndOp::Data && frame.socket_id == socket_id) {
-            return std::move(frame.blob);
+        if (frame.op == LdndOp::Data) {
+            if (frame.socket_id == socket_id) {
+                return std::move(frame.blob);
+            }
+            impl->QueueData(std::move(frame));
+            continue;
         }
         if (frame.op == LdndOp::Reply) {
             throw std::runtime_error("unexpected ldnd reply while waiting for socket data");
@@ -239,6 +384,11 @@ bool LdndConnection::TryReceiveData(u32 socket_id, std::vector<u8>& data, u32 ti
         throw std::runtime_error("ldnd is not connected");
     }
 
+    if (auto pending = impl->TakeData(socket_id)) {
+        data = std::move(*pending);
+        return true;
+    }
+
     const ULONGLONG deadline = GetTickCount64() + timeout_ms;
     for (;;) {
         DWORD available = 0;
@@ -248,9 +398,13 @@ bool LdndConnection::TryReceiveData(u32 socket_id, std::vector<u8>& data, u32 ti
 
         if (available >= LdndProtocol::HeaderLength) {
             LdndFrame frame = ReadFrame();
-            if (frame.op == LdndOp::Data && frame.socket_id == socket_id) {
-                data = std::move(frame.blob);
-                return true;
+            if (frame.op == LdndOp::Data) {
+                if (frame.socket_id == socket_id) {
+                    data = std::move(frame.blob);
+                    return true;
+                }
+                impl->QueueData(std::move(frame));
+                continue;
             }
             if (frame.op == LdndOp::Reply) {
                 throw std::runtime_error("unexpected ldnd reply while waiting for socket data");
@@ -272,6 +426,7 @@ bool LdndConnection::TryReceiveData(u32 socket_id, std::vector<u8>& data, u32 ti
 
 void LdndConnection::CloseSocket(u32 socket_id) {
     // daemon.c intentionally sends no reply for LDND_OP_CLOSE.
+    impl->pending_data.erase(socket_id);
     WriteFrame(LdndFrame{LdndOp::Close, socket_id, 0, 0, 0, {}});
 }
 

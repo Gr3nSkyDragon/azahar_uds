@@ -594,6 +594,9 @@ private:
     /// Wraps an emulated UDS packet in a physical 802.11 management/data MPDU and queues it.
     void SendPhysicalPacket(const Network::WifiPacket& packet);
 
+    /// Sends the association request which a physical UDS client must issue after auth SEQ2.
+    void SendPhysicalAssociationRequest(const MacAddress& host_address);
+
     boost::optional<Network::MacAddress> GetNodeMacAddress(u16 dest_node_id, u8 flags);
 
     // Event that is signaled every time the connection status changes.
@@ -699,10 +702,20 @@ private:
     // Physical nl80211 monitor used by the experimental UDS Real backend.
     std::unique_ptr<UdsReal::Nl80211Monitor> real_monitor;
     std::optional<std::array<u8, 16>> physical_data_ccmp_key;
+    // Nintendo SecureData has its own per-sender sequence, independent of the 802.11 sequence
+    // control field and the CCMP packet number. Every host-originated SecureData packet shares
+    // this counter so a retail peer does not discard later game packets as duplicates.
+    u16 secure_data_tx_sequence_number{};
     u64 physical_tx_packet_number{1};
     u16 physical_tx_sequence_number{};
+    bool physical_association_request_sent{};
+    bool association_response_handled{};
     std::size_t physical_rx_frame_count{};
     std::size_t physical_rx_ccmp_failure_count{};
+    std::size_t connection_status_trace_count{};
+    // Last management sequence answered for each physical client. Monitor-mode capture receives
+    // every 802.11 retransmission, but a UDS management request must only be answered once.
+    std::map<u16, u16> physical_management_reply_sequences;
 
     template <class Archive>
     void serialize(Archive& ar, const unsigned int);

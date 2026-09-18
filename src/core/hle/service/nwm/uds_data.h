@@ -119,11 +119,13 @@ struct EAPoLLogoffPacket {
 static_assert(sizeof(EAPoLLogoffPacket) == 0x298, "EAPoLLogoffPacket has the wrong size");
 
 /**
- * Generates an unencrypted 802.11 data payload.
+ * Generates an unencrypted 802.11 SecureData payload. Management payloads are consumed by
+ * nwm::UDS itself; ordinary payloads are delivered to the application's bound data channel.
  * @returns The generated frame payload.
  */
 std::vector<u8> GenerateDataPayload(std::span<const u8> data, u8 channel, u16 dest_node,
-                                    u16 src_node, u16 sequence_number);
+                                    u16 src_node, u16 sequence_number,
+                                    bool is_management = false);
 
 /*
  * Returns the SecureDataHeader stored in an 802.11 data frame.

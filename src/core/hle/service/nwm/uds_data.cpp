@@ -38,15 +38,15 @@ static std::vector<u8> GenerateLLCHeader(EtherType protocol) {
  * @returns a buffer with the bytes of the generated header.
  */
 static std::vector<u8> GenerateSecureDataHeader(u16 data_size, u8 channel, u16 dest_node_id,
-                                                u16 src_node_id, u16 sequence_number) {
+                                                u16 src_node_id, u16 sequence_number,
+                                                bool is_management) {
     SecureDataHeader header{};
     header.protocol_size = data_size + sizeof(SecureDataHeader);
     // Note: This size includes everything except the first 4 bytes of the structure,
     // reinforcing the hypotheses that the first 4 bytes are actually the header of
     // another container protocol.
     header.securedata_size = data_size + sizeof(SecureDataHeader) - 4;
-    // Frames sent by the emulated application are never UDS management frames
-    header.is_management = 0;
+    header.is_management = is_management ? 1 : 0;
     header.data_channel = channel;
     header.sequence_number = sequence_number;
     header.dest_node_id = dest_node_id;
@@ -269,10 +269,11 @@ std::vector<u8> EncryptDataFrame(
 }
 
 std::vector<u8> GenerateDataPayload(std::span<const u8> data, u8 channel, u16 dest_node,
-                                    u16 src_node, u16 sequence_number) {
+                                    u16 src_node, u16 sequence_number, bool is_management) {
     std::vector<u8> buffer = GenerateLLCHeader(EtherType::SecureData);
     std::vector<u8> securedata_header = GenerateSecureDataHeader(
-        static_cast<u16>(data.size()), channel, dest_node, src_node, sequence_number);
+        static_cast<u16>(data.size()), channel, dest_node, src_node, sequence_number,
+        is_management);
 
     buffer.insert(buffer.end(), securedata_header.begin(), securedata_header.end());
     buffer.insert(buffer.end(), data.begin(), data.end());

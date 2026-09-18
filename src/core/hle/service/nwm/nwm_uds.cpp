@@ -77,6 +77,15 @@ u32 FingerprintUsername(const NodeInfo& node) {
         reinterpret_cast<const u8*>(node.username.data()), sizeof(node.username)});
 }
 
+u32 FingerprintFriendCodeSeed(const NodeInfo& node) {
+    return FingerprintBytes(std::span<const u8>{
+        reinterpret_cast<const u8*>(&node.friend_code_seed), sizeof(node.friend_code_seed)});
+}
+
+u32 FingerprintNodeInfo(const NodeInfo& node) {
+    return FingerprintBytes(std::span<const u8>{reinterpret_cast<const u8*>(&node), sizeof(node)});
+}
+
 std::string FormatHexBytes(std::span<const u8> bytes) {
     constexpr char Hex[] = "0123456789ABCDEF";
     std::string output;
@@ -124,6 +133,9 @@ std::vector<u8> GeneratePhysicalDataFrame(std::span<const u8> payload,
     constexpr u16 ToDS = 0x0100;
     constexpr u16 FromDS = 0x0200;
     constexpr u16 Protected = 0x4000;
+    // Restore the last known-good address layout. The FromDS host-broadcast experiment did not
+    // change the retail failure timing, so group-addressed UDS data remains NoDS while we inspect
+    // the exact injected bytes and separately request no link-layer acknowledgement in radiotap.
     const bool no_ds = destination == Network::BroadcastMac;
     const u16 ds_bits = no_ds ? 0 : (from_ds ? FromDS : ToDS);
     const u16 frame_control = static_cast<u16>(DataFrameControl | Protected | ds_bits);
@@ -302,6 +314,12 @@ void NWM_UDS::HandleAssociationResponseFrame(const Network::WifiPacket& packet) 
                       static_cast<u32>(connection_status.status));
             return;
         }
+        if (association_response_handled) {
+            LOG_DEBUG(Service_NWM,
+                      "Ignored retried AssociationResponseFrame after EAPoL-Start was sent");
+            return;
+        }
+        association_response_handled = true;
     }
 
     // Send the EAPoL-Start packet to the server.
@@ -344,6 +362,18 @@ void NWM_UDS::HandleEAPoLPacket(const Network::WifiPacket& packet) {
         auto eapol_start = DeserializeEAPolStartPacket(packet.data);
 
         auto node = DeserializeNodeInfo(eapol_start.node);
+
+        LOG_INFO(Service_NWM,
+                 "UDS JOIN TRACE RX EAPOL-START: plaintextBytes={}, plaintextFingerprint="
+                 "0x{:08X}, associationId={}, connectionType=0x{:02X}, wireNodeId={}, "
+                 "friendCodeSeedNonzero={}, friendCodeSeedFingerprint=0x{:08X}, "
+                 "usernameFingerprint=0x{:08X}, nodeFingerprint=0x{:08X}, plaintext={}",
+                 packet.data.size(), FingerprintBytes(packet.data),
+                 static_cast<u16>(eapol_start.association_id),
+                 static_cast<u8>(eapol_start.connection_type),
+                 static_cast<u16>(eapol_start.node.network_node_id),
+                 static_cast<u64>(node.friend_code_seed) != 0, FingerprintFriendCodeSeed(node),
+                 FingerprintUsername(node), FingerprintNodeInfo(node), FormatHexBytes(packet.data));
 
         // The nwm::UDS IPC API uses 1 for a normal client, which is also what Azahar's
         // room transport historically placed in this byte. A retail 3DS, however, uses
@@ -405,6 +435,32 @@ void NWM_UDS::HandleEAPoLPacket(const Network::WifiPacket& packet) {
         // receive the updated node map separately through BroadcastNodeMap above.
         eapol_logoff.destination_address = packet.transmitter_address;
         eapol_logoff.type = WifiPacket::PacketType::Data;
+
+        const NodeInfo& host_node = node_info[0];
+        const u16 client_node_id = node.network_node_id;
+        const NodeInfo* client_node =
+            client_node_id > 0 && client_node_id <= node_info.size()
+                ? &node_info[client_node_id - 1]
+                : nullptr;
+        LOG_INFO(Service_NWM,
+                 "UDS JOIN TRACE TX EAPOL-LOGOFF: assignedNodeId={}, connectedNodes={}, "
+                 "maxNodes={}, hostNodeId={}, hostFriendCodeSeedNonzero={}, "
+                 "hostFriendCodeSeedFingerprint=0x{:08X}, hostUsernameFingerprint=0x{:08X}, "
+                 "hostNodeFingerprint=0x{:08X}, clientNodeId={}, "
+                 "clientFriendCodeSeedNonzero={}, clientFriendCodeSeedFingerprint=0x{:08X}, "
+                 "clientUsernameFingerprint=0x{:08X}, clientNodeFingerprint=0x{:08X}, "
+                 "plaintextBytes={}, plaintextFingerprint=0x{:08X}, plaintext={}",
+                 static_cast<u16>(node.network_node_id), network_info.total_nodes,
+                 network_info.max_nodes, static_cast<u16>(host_node.network_node_id),
+                 static_cast<u64>(host_node.friend_code_seed) != 0,
+                 FingerprintFriendCodeSeed(host_node), FingerprintUsername(host_node),
+                 FingerprintNodeInfo(host_node),
+                 client_node ? static_cast<u16>(client_node->network_node_id) : 0,
+                 client_node && static_cast<u64>(client_node->friend_code_seed) != 0,
+                 client_node ? FingerprintFriendCodeSeed(*client_node) : 0,
+                 client_node ? FingerprintUsername(*client_node) : 0,
+                 client_node ? FingerprintNodeInfo(*client_node) : 0, eapol_logoff.data.size(),
+                 FingerprintBytes(eapol_logoff.data), FormatHexBytes(eapol_logoff.data));
 
         SendPacket(eapol_logoff);
 
@@ -544,21 +600,59 @@ void NWM_UDS::HandleSecureDataPacket(const Network::WifiPacket& packet) {
     }
 
     // Management payloads are consumed by nwm::UDS itself and are not exposed through PullPacket.
-    // The room transport never generated these, but retail hardware does shortly after joining.
-    // Until each subtype is understood, consume it safely and record the complete payload rather
-    // than terminating the emulator or incorrectly delivering it to the game.
+    // A retail client sends a one-byte channel-3 management packet periodically after joining.
+    // Mirror each new request back to that client using the host's own SecureData sequence.
+    // Monitor-mode capture sees the client's link-layer retries, so suppress repeated copies of
+    // the same client management sequence.
     if (secure_data.is_management) {
         const std::size_t payload_size = protocol_size - sizeof(SecureDataHeader);
         const std::span<const u8> payload{
             packet.data.data() + SecureDataPrefixSize, payload_size};
+        const u16 source_node = secure_data.src_node_id;
+        const u16 destination_node = secure_data.dest_node_id;
+        const u16 sequence = secure_data.sequence_number;
+        const bool is_client_ping =
+            connection_status.status == NetworkStatus::ConnectedAsHost &&
+            secure_data.data_channel == 3 && payload.size() == 1 && payload.front() == 0;
+
+        if (is_client_ping) {
+            const auto previous = physical_management_reply_sequences.find(source_node);
+            if (previous != physical_management_reply_sequences.end() &&
+                previous->second == sequence) {
+                LOG_TRACE(Service_NWM,
+                          "UDS Real: suppressed duplicate management SecureData request, "
+                          "channel={}, sequence={}, sourceNode={}",
+                          secure_data.data_channel, sequence, source_node);
+                return;
+            }
+            physical_management_reply_sequences[source_node] = sequence;
+
+            const u16 reply_sequence = secure_data_tx_sequence_number++;
+            Network::WifiPacket reply;
+            reply.destination_address = packet.transmitter_address;
+            reply.channel = packet.channel;
+            reply.data = GenerateDataPayload(payload, secure_data.data_channel, source_node,
+                                             connection_status.network_node_id, reply_sequence,
+                                             true);
+            reply.type = Network::WifiPacket::PacketType::Data;
+            SendPacket(reply);
+
+            LOG_INFO(Service_NWM,
+                     "UDS Real: replied to management SecureData request, channel={}, "
+                     "requestSequence={}, replySequence={}, sourceNode={}, destinationNode={}, "
+                     "payloadBytes={}, payload={}",
+                     secure_data.data_channel, sequence, reply_sequence,
+                     static_cast<u16>(connection_status.network_node_id), source_node,
+                     payload.size(), FormatHexBytes(payload));
+            return;
+        }
+
         LOG_INFO(Service_NWM,
-                 "UDS Real: consumed management SecureData packet, management={}, channel={}, "
-                 "sequence={}, sourceNode={}, destinationNode={}, payloadBytes={}, payload={}",
-                 secure_data.is_management, secure_data.data_channel,
-                 static_cast<u16>(secure_data.sequence_number),
-                 static_cast<u16>(secure_data.src_node_id),
-                 static_cast<u16>(secure_data.dest_node_id), payload.size(),
-                 FormatHexBytes(payload));
+                 "UDS Real: consumed unsupported management SecureData packet, management={}, "
+                 "channel={}, sequence={}, sourceNode={}, destinationNode={}, payloadBytes={}, "
+                 "payload={}",
+                 secure_data.is_management, secure_data.data_channel, sequence, source_node,
+                 destination_node, payload.size(), FormatHexBytes(payload));
         return;
     }
 
@@ -568,16 +662,44 @@ void NWM_UDS::HandleSecureDataPacket(const Network::WifiPacket& packet) {
     auto channel_info = channel_data.find(secure_data.data_channel);
     // Ignore packets from channels we're not interested in.
     if (channel_info == channel_data.end()) {
+        LOG_INFO(Service_NWM,
+                 "UDS Real: discarded application SecureData for unbound channel, channel={}, "
+                 "sequence={}, sourceNode={}, destinationNode={}, payloadBytes={}",
+                 secure_data.data_channel, static_cast<u16>(secure_data.sequence_number),
+                 static_cast<u16>(secure_data.src_node_id),
+                 static_cast<u16>(secure_data.dest_node_id),
+                 protocol_size - sizeof(SecureDataHeader));
         return;
     }
 
     if (channel_info->second.network_node_id != BroadcastNetworkNodeId &&
         channel_info->second.network_node_id != secure_data.src_node_id) {
+        LOG_INFO(Service_NWM,
+                 "UDS Real: discarded application SecureData for filtered source, channel={}, "
+                 "sequence={}, sourceNode={}, bindSourceNode={}",
+                 secure_data.data_channel, static_cast<u16>(secure_data.sequence_number),
+                 static_cast<u16>(secure_data.src_node_id),
+                 channel_info->second.network_node_id);
         return;
     }
 
     // Add the received packet to the data queue.
     channel_info->second.received_packets.emplace_back(packet.data);
+
+    const std::size_t application_payload_size = protocol_size - sizeof(SecureDataHeader);
+    const std::span<const u8> application_payload{
+        packet.data.data() + SecureDataPrefixSize, application_payload_size};
+
+    LOG_INFO(Service_NWM,
+             "UDS DATA TRACE RX QUEUE: channel={}, secureSequence={}, sourceNode={}, "
+             "destinationNode={}, payloadBytes={}, payloadFingerprint=0x{:08X}, payload={}, "
+             "secureDataBytes={}, secureDataFingerprint=0x{:08X}, queueDepth={}",
+             secure_data.data_channel, static_cast<u16>(secure_data.sequence_number),
+             static_cast<u16>(secure_data.src_node_id),
+             static_cast<u16>(secure_data.dest_node_id), application_payload_size,
+             FingerprintBytes(application_payload), FormatHexBytes(application_payload),
+             packet.data.size(), FingerprintBytes(packet.data),
+             channel_info->second.received_packets.size());
 
     // Signal the data event. We can do this directly because we use SignalEventAsync
     SignalEventAsync(channel_info->second.event);
@@ -628,8 +750,32 @@ void NWM_UDS::SendAssociationResponseFrame(const MacAddress& address) {
 }
 
 void NWM_UDS::HandleAuthenticationFrame(const Network::WifiPacket& packet) {
-    // Only the SEQ1 auth frame is handled here, the SEQ2 frame doesn't need any special behavior
-    if (GetAuthenticationSeqNumber(packet.data) == AuthenticationSeq::SEQ1) {
+    const AuthenticationSeq sequence = GetAuthenticationSeqNumber(packet.data);
+
+    // Room multiplayer historically treats auth SEQ2 as sufficient and waits for the synthetic
+    // AssociationResponse packet. A physical UDS client must instead transmit a real 802.11
+    // association request after the host authenticates it. The exact request body below was
+    // captured from a retail 3DS joining an Azahar-hosted Pokemon X network.
+    if (sequence == AuthenticationSeq::SEQ2) {
+#ifdef _WIN32
+        bool send_association_request = false;
+        {
+            std::scoped_lock lock(connection_status_mutex);
+            if (connection_status.status == NetworkStatus::Connecting &&
+                packet.transmitter_address == network_info.host_mac_address &&
+                !physical_association_request_sent) {
+                physical_association_request_sent = true;
+                send_association_request = true;
+            }
+        }
+        if (send_association_request) {
+            SendPhysicalAssociationRequest(packet.transmitter_address);
+        }
+#endif
+        return;
+    }
+
+    if (sequence == AuthenticationSeq::SEQ1) {
         using Network::WifiPacket;
         AuthenticationFrame auth_request;
         memcpy(&auth_request, packet.data.data(), sizeof(auth_request));
@@ -808,10 +954,75 @@ void NWM_UDS::SendPhysicalPacket(const Network::WifiPacket& packet) {
                         "UDS Real: physical data TX skipped because no CCMP key is configured");
             return;
         }
+        // Deliberate rollback to the last proven transport. The 2026-09-17 10:43 and 11:20
+        // tests exchanged bidirectional Pokemon SecureData when every protected frame used the
+        // software CCMP/monitor-injection path. Enabling the companion kernel AP displaced that
+        // working path and introduced separate CCMP state plus host-stack traffic on udsap0.
         const bool from_ds = status == NetworkStatus::ConnectedAsHost;
+        const u64 packet_number = physical_tx_packet_number++;
+        const u16 dot11_sequence = physical_tx_sequence_number++;
         frame = GeneratePhysicalDataFrame(packet.data, *ccmp_key, transmitter, destination,
-                                          host_address, from_ds, physical_tx_packet_number++,
-                                          physical_tx_sequence_number++);
+                                          host_address, from_ds, packet_number, dot11_sequence);
+
+        if (packet.data.size() >= sizeof(LLCHeader) &&
+            GetFrameEtherType(packet.data) == EtherType::EAPoL) {
+            LOG_INFO(Service_NWM,
+                     "UDS JOIN TRACE TX EAPOL MPDU: dot11Sequence={}, ccmpPN={}, broadcast={}, "
+                     "fromDS={}, destinationMac={:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}, "
+                     "plaintextBytes={}, plaintextFingerprint=0x{:08X}, mpduBytes={}, "
+                     "mpduFingerprint=0x{:08X}, mpdu={}",
+                     dot11_sequence, packet_number, destination == Network::BroadcastMac,
+                     from_ds, destination[0], destination[1], destination[2], destination[3],
+                     destination[4], destination[5], packet.data.size(),
+                     FingerprintBytes(packet.data), frame.size(), FingerprintBytes(frame),
+                     FormatHexBytes(frame));
+        }
+
+        if (packet.data.size() >= sizeof(LLCHeader) + sizeof(SecureDataHeader) &&
+            GetFrameEtherType(packet.data) == EtherType::SecureData) {
+            const auto secure_data = ParseSecureDataHeader(packet.data);
+            if (!secure_data.is_management) {
+                LOG_INFO(Service_NWM,
+                         "UDS DATA TRACE TX MPDU: channel={}, secureSequence={}, "
+                         "sourceNode={}, destinationNode={}, protocolSize={}, secureDataSize={}, "
+                         "dot11Sequence={}, ccmpPN={}, broadcast={}, fromDS={}, dsMode={}, "
+                         "destinationMac={:02X}:{:02X}:{:02X}:"
+                         "{:02X}:{:02X}:{:02X}, plaintextBytes={}, plaintextFingerprint="
+                         "0x{:08X}, plaintext={}, mpduBytes={}, mpduFingerprint=0x{:08X}, "
+                         "mpdu={}",
+                         secure_data.data_channel,
+                         static_cast<u16>(secure_data.sequence_number),
+                         static_cast<u16>(secure_data.src_node_id),
+                         static_cast<u16>(secure_data.dest_node_id),
+                         static_cast<u16>(secure_data.protocol_size),
+                         static_cast<u16>(secure_data.securedata_size), dot11_sequence,
+                         packet_number, destination == Network::BroadcastMac, from_ds,
+                         from_ds ? "FromDS"
+                                 : (destination == Network::BroadcastMac ? "NoDS" : "ToDS"),
+                         destination[0], destination[1], destination[2], destination[3],
+                         destination[4], destination[5], packet.data.size(),
+                         FingerprintBytes(packet.data), FormatHexBytes(packet.data), frame.size(),
+                         FingerprintBytes(frame), FormatHexBytes(frame));
+            } else {
+                LOG_INFO(Service_NWM,
+                         "UDS CONTROL TRACE TX MPDU: channel={}, secureSequence={}, "
+                         "sourceNode={}, destinationNode={}, protocolSize={}, secureDataSize={}, "
+                         "dot11Sequence={}, ccmpPN={}, destinationMac={:02X}:{:02X}:{:02X}:"
+                         "{:02X}:{:02X}:{:02X}, plaintextBytes={}, plaintextFingerprint="
+                         "0x{:08X}, plaintext={}, mpduBytes={}, mpduFingerprint=0x{:08X}, "
+                         "mpdu={}",
+                         secure_data.data_channel,
+                         static_cast<u16>(secure_data.sequence_number),
+                         static_cast<u16>(secure_data.src_node_id),
+                         static_cast<u16>(secure_data.dest_node_id),
+                         static_cast<u16>(secure_data.protocol_size),
+                         static_cast<u16>(secure_data.securedata_size), dot11_sequence,
+                         packet_number, destination[0], destination[1], destination[2],
+                         destination[3], destination[4], destination[5], packet.data.size(),
+                         FingerprintBytes(packet.data), FormatHexBytes(packet.data), frame.size(),
+                         FingerprintBytes(frame), FormatHexBytes(frame));
+            }
+        }
         break;
     }
     default:
@@ -826,6 +1037,74 @@ void NWM_UDS::SendPhysicalPacket(const Network::WifiPacket& packet) {
 #endif
 }
 
+void NWM_UDS::SendPhysicalAssociationRequest(const MacAddress& host_address) {
+#ifdef _WIN32
+    if (!real_monitor || !real_monitor->IsRunning()) {
+        return;
+    }
+
+    u32 network_id{};
+    u8 channel{};
+    {
+        std::scoped_lock lock{connection_status_mutex};
+        if (connection_status.status != NetworkStatus::Connecting) {
+            return;
+        }
+        network_id = static_cast<u32>(network_info.network_id);
+        channel = network_channel;
+    }
+
+    // Retail Pokemon X association request captured on the air:
+    //   capability=0x0431, listen interval=1
+    //   SSID=<network id as eight uppercase hexadecimal characters>
+    //   supported rates=82 84 8B 0C 12 96 18 24
+    //   extended rates=30 48 60 6C
+    std::vector<u8> body;
+    body.reserve(30);
+    AppendU16(body, 0x0431);
+    AppendU16(body, 1);
+
+    body.push_back(static_cast<u8>(TagId::SSID));
+    body.push_back(8);
+    constexpr char Hex[] = "0123456789ABCDEF";
+    for (int shift = 28; shift >= 0; shift -= 4) {
+        body.push_back(static_cast<u8>(Hex[(network_id >> shift) & 0x0F]));
+    }
+
+    constexpr std::array<u8, 8> SupportedRates{0x82, 0x84, 0x8B, 0x0C,
+                                               0x12, 0x96, 0x18, 0x24};
+    constexpr std::array<u8, 4> ExtendedRates{0x30, 0x48, 0x60, 0x6C};
+    body.push_back(static_cast<u8>(TagId::SupportedRates));
+    body.push_back(static_cast<u8>(SupportedRates.size()));
+    body.insert(body.end(), SupportedRates.begin(), SupportedRates.end());
+    body.push_back(50); // Extended Supported Rates.
+    body.push_back(static_cast<u8>(ExtendedRates.size()));
+    body.insert(body.end(), ExtendedRates.begin(), ExtendedRates.end());
+
+    const MacAddress transmitter = GetMacAddress();
+    const u16 dot11_sequence = physical_tx_sequence_number++;
+    const std::vector<u8> frame =
+        GeneratePhysicalManagementFrame(0x0000, transmitter, host_address, host_address,
+                                        dot11_sequence, body);
+
+    LOG_INFO(Service_NWM,
+             "UDS JOIN TRACE TX ASSOCIATION REQUEST: dot11Sequence={}, channel={}, "
+             "source={:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}, "
+             "host={:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}, networkId=0x{:08X}, "
+             "bodyBytes={}, bodyFingerprint=0x{:08X}, body={}, mpduBytes={}, "
+             "mpduFingerprint=0x{:08X}, mpdu={}",
+             dot11_sequence, channel, transmitter[0], transmitter[1], transmitter[2],
+             transmitter[3], transmitter[4], transmitter[5], host_address[0], host_address[1],
+             host_address[2], host_address[3], host_address[4], host_address[5], network_id,
+             body.size(), FingerprintBytes(body), FormatHexBytes(body), frame.size(),
+             FingerprintBytes(frame), FormatHexBytes(frame));
+
+    real_monitor->SubmitFrame(frame);
+#else
+    (void)host_address;
+#endif
+}
+
 void NWM_UDS::OnPhysicalFrameReceived(UdsReal::CapturedFrame frame) {
 #ifdef _WIN32
     ++physical_rx_frame_count;
@@ -835,12 +1114,16 @@ void NWM_UDS::OnPhysicalFrameReceived(UdsReal::CapturedFrame frame) {
     packet.transmitter_address = frame.transmitter_address;
     packet.destination_address = frame.destination_address;
 
+    std::optional<u64> received_packet_number;
     if (frame.type == 0) {
         switch (frame.subtype) {
         case 11: // Authentication.
             if (frame.body.size() < sizeof(AuthenticationFrame)) {
                 LOG_WARNING(Service_NWM, "UDS Real: truncated physical authentication frame");
                 return;
+            }
+            if (real_monitor) {
+                real_monitor->ActivateAccessPoint();
             }
             packet.type = Network::WifiPacket::PacketType::Authentication;
             packet.data = std::move(frame.body);
@@ -854,6 +1137,9 @@ void NWM_UDS::OnPhysicalFrameReceived(UdsReal::CapturedFrame frame) {
             packet.data = std::move(frame.body);
             break;
         case 12: // Deauthentication.
+            if (real_monitor) {
+                real_monitor->RemoveAccessPointStation(frame.transmitter_address);
+            }
             if (frame.body.size() >= 2) {
                 const u16 reason = static_cast<u16>(frame.body[0]) |
                                    (static_cast<u16>(frame.body[1]) << 8);
@@ -874,6 +1160,9 @@ void NWM_UDS::OnPhysicalFrameReceived(UdsReal::CapturedFrame frame) {
                      frame.transmitter_address[0], frame.transmitter_address[1],
                      frame.transmitter_address[2], frame.transmitter_address[3],
                      frame.transmitter_address[4], frame.transmitter_address[5]);
+            if (real_monitor) {
+                real_monitor->RegisterAccessPointStation(frame.transmitter_address, frame.body);
+            }
             SendAssociationResponseFrame(frame.transmitter_address);
             return;
         default:
@@ -903,6 +1192,7 @@ void NWM_UDS::OnPhysicalFrameReceived(UdsReal::CapturedFrame frame) {
 
             const u64 packet_number = ReadCCMPPacketNumber(
                 std::span<const u8>{frame.body.data(), std::size_t{8}});
+            received_packet_number = packet_number;
             auto decrypted = DecryptDataFrame(
                 std::span<const u8>{frame.body.data() + 8, frame.body.size() - 8}, *ccmp_key,
                 frame.transmitter_address, frame.destination_address, frame.bssid, packet_number,
@@ -927,6 +1217,95 @@ void NWM_UDS::OnPhysicalFrameReceived(UdsReal::CapturedFrame frame) {
             LOG_WARNING(Service_NWM,
                         "UDS Real: physical data frame did not contain a Nintendo SNAP payload");
             return;
+        }
+
+        if (packet.data.size() >= sizeof(LLCHeader) + sizeof(SecureDataHeader) &&
+            GetFrameEtherType(packet.data) == EtherType::SecureData) {
+            const auto secure_data = ParseSecureDataHeader(packet.data);
+            if (!secure_data.is_management) {
+                const bool retry = (frame.frame_control & 0x0800) != 0;
+                LOG_INFO(Service_NWM,
+                         "UDS DATA TRACE RX MPDU: channel={}, secureSequence={}, "
+                         "sourceNode={}, destinationNode={}, protocolSize={}, secureDataSize={}, "
+                         "dot11Sequence={}, retry={}, ccmpPN={}, broadcast={}, "
+                         "sourceMac={:02X}:{:02X}:{:02X}:{:02X}:"
+                         "{:02X}:{:02X}, destinationMac={:02X}:{:02X}:{:02X}:{:02X}:"
+                         "{:02X}:{:02X}, mpduBodyBytes={}, mpduBodyFingerprint=0x{:08X}, "
+                         "mpduBody={}",
+                         secure_data.data_channel,
+                         static_cast<u16>(secure_data.sequence_number),
+                         static_cast<u16>(secure_data.src_node_id),
+                         static_cast<u16>(secure_data.dest_node_id),
+                         static_cast<u16>(secure_data.protocol_size),
+                         static_cast<u16>(secure_data.securedata_size),
+                         frame.sequence_control >> 4, retry, received_packet_number.value_or(0),
+                         frame.destination_address == Network::BroadcastMac,
+                         frame.transmitter_address[0], frame.transmitter_address[1],
+                         frame.transmitter_address[2], frame.transmitter_address[3],
+                         frame.transmitter_address[4], frame.transmitter_address[5],
+                         frame.destination_address[0], frame.destination_address[1],
+                         frame.destination_address[2], frame.destination_address[3],
+                         frame.destination_address[4], frame.destination_address[5],
+                         frame.body.size(), FingerprintBytes(frame.body),
+                         FormatHexBytes(frame.body));
+                LOG_INFO(Service_NWM,
+                         "UDS DATA TRACE RX SECUREDATA: channel={}, secureSequence={}, "
+                         "sourceNode={}, destinationNode={}, protocolSize={}, secureDataSize={}, "
+                         "plaintextBytes={}, "
+                         "plaintextFingerprint=0x{:08X}, plaintext={}",
+                         secure_data.data_channel,
+                         static_cast<u16>(secure_data.sequence_number),
+                         static_cast<u16>(secure_data.src_node_id),
+                         static_cast<u16>(secure_data.dest_node_id),
+                         static_cast<u16>(secure_data.protocol_size),
+                         static_cast<u16>(secure_data.securedata_size), packet.data.size(),
+                         FingerprintBytes(packet.data), FormatHexBytes(packet.data));
+            } else {
+                LOG_INFO(Service_NWM,
+                         "UDS CONTROL TRACE RX MPDU: channel={}, secureSequence={}, "
+                         "sourceNode={}, destinationNode={}, protocolSize={}, secureDataSize={}, "
+                         "dot11Sequence={}, retry={}, ccmpPN={}, sourceMac={:02X}:{:02X}:"
+                         "{:02X}:{:02X}:{:02X}:{:02X}, destinationMac={:02X}:{:02X}:{:02X}:"
+                         "{:02X}:{:02X}:{:02X}, plaintextBytes={}, plaintextFingerprint="
+                         "0x{:08X}, plaintext={}, mpduBodyBytes={}, mpduBodyFingerprint="
+                         "0x{:08X}, mpduBody={}",
+                         secure_data.data_channel,
+                         static_cast<u16>(secure_data.sequence_number),
+                         static_cast<u16>(secure_data.src_node_id),
+                         static_cast<u16>(secure_data.dest_node_id),
+                         static_cast<u16>(secure_data.protocol_size),
+                         static_cast<u16>(secure_data.securedata_size),
+                         frame.sequence_control >> 4,
+                         (frame.frame_control & 0x0800) != 0,
+                         received_packet_number.value_or(0), frame.transmitter_address[0],
+                         frame.transmitter_address[1], frame.transmitter_address[2],
+                         frame.transmitter_address[3], frame.transmitter_address[4],
+                         frame.transmitter_address[5], frame.destination_address[0],
+                         frame.destination_address[1], frame.destination_address[2],
+                         frame.destination_address[3], frame.destination_address[4],
+                         frame.destination_address[5], packet.data.size(),
+                         FingerprintBytes(packet.data), FormatHexBytes(packet.data),
+                         frame.body.size(), FingerprintBytes(frame.body),
+                         FormatHexBytes(frame.body));
+            }
+        } else if (packet.data.size() >= sizeof(LLCHeader) &&
+                   GetFrameEtherType(packet.data) == EtherType::EAPoL) {
+            LOG_INFO(Service_NWM,
+                     "UDS JOIN TRACE RX EAPOL MPDU: dot11Sequence={}, retry={}, ccmpPN={}, "
+                     "sourceMac={:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}, "
+                     "destinationMac={:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}, "
+                     "plaintextBytes={}, plaintextFingerprint=0x{:08X}, plaintext={}, "
+                     "mpduBodyBytes={}, mpduBodyFingerprint=0x{:08X}, mpduBody={}",
+                     frame.sequence_control >> 4, (frame.frame_control & 0x0800) != 0,
+                     received_packet_number.value_or(0), frame.transmitter_address[0],
+                     frame.transmitter_address[1], frame.transmitter_address[2],
+                     frame.transmitter_address[3], frame.transmitter_address[4],
+                     frame.transmitter_address[5], frame.destination_address[0],
+                     frame.destination_address[1], frame.destination_address[2],
+                     frame.destination_address[3], frame.destination_address[4],
+                     frame.destination_address[5], packet.data.size(),
+                     FingerprintBytes(packet.data), FormatHexBytes(packet.data),
+                     frame.body.size(), FingerprintBytes(frame.body), FormatHexBytes(frame.body));
         }
     } else {
         return;
@@ -1132,6 +1511,16 @@ ResultVal<std::shared_ptr<Kernel::Event>> NWM_UDS::Initialize(
 
     current_node = node;
     initialized = true;
+    connection_status_trace_count = 0;
+
+    LOG_INFO(Service_NWM,
+             "UDS STATE TRACE Initialize: version=0x{:04X}, nodeId={}, "
+             "friendCodeSeedNonzero={}, friendCodeSeedFingerprint=0x{:08X}, "
+             "usernameFingerprint=0x{:08X}, nodeFingerprint=0x{:08X}",
+             version, static_cast<u16>(current_node.network_node_id),
+             static_cast<u64>(current_node.friend_code_seed) != 0,
+             FingerprintFriendCodeSeed(current_node), FingerprintUsername(current_node),
+             FingerprintNodeInfo(current_node));
 
     recv_buffer_memory = std::move(sharedmem);
     ASSERT_MSG(recv_buffer_memory->GetSize() == sharedmem_size, "Invalid shared memory size.");
@@ -1154,7 +1543,7 @@ ResultVal<std::shared_ptr<Kernel::Event>> NWM_UDS::Initialize(
     }
     if (!real_monitor->IsRunning()) {
         real_monitor->Start(
-            network_channel, [this](UdsReal::CapturedBeacon beacon) {
+            network_channel, GetMacAddress(), [this](UdsReal::CapturedBeacon beacon) {
                 Network::WifiPacket packet{};
                 packet.type = Network::WifiPacket::PacketType::Beacon;
                 packet.data = std::move(beacon.frame);
@@ -1227,6 +1616,20 @@ ConnectionStatus NWM_UDS::GetConnectionStatusHLE() {
     std::scoped_lock lock(connection_status_mutex);
     ConnectionStatus cs_out = connection_status;
 
+    if (connection_status_trace_count < 8 || cs_out.changed_nodes != 0) {
+        LOG_INFO(Service_NWM,
+                 "UDS STATE TRACE GetConnectionStatus #{}: status={}, reason={}, nodeId={}, "
+                 "totalNodes={}, maxNodes={}, nodeBitmask=0x{:04X}, changedNodes=0x{:04X}, "
+                 "stateFingerprint=0x{:08X}",
+                 connection_status_trace_count + 1, static_cast<u32>(cs_out.status),
+                 static_cast<u32>(cs_out.status_change_reason),
+                 static_cast<u16>(cs_out.network_node_id), cs_out.total_nodes, cs_out.max_nodes,
+                 static_cast<u16>(cs_out.node_bitmask), static_cast<u16>(cs_out.changed_nodes),
+                 FingerprintBytes(std::span<const u8>{reinterpret_cast<const u8*>(&cs_out),
+                                                      sizeof(cs_out)}));
+    }
+    ++connection_status_trace_count;
+
     // Reset the bitmask of changed nodes after each call to this
     // function to prevent falsely informing games of outstanding
     // changes in subsequent calls.
@@ -1281,6 +1684,15 @@ void NWM_UDS::GetNodeInformation(Kernel::HLERequestContext& ctx) {
         IPC::RequestBuilder rb = rp.MakeBuilder(11, 0);
         rb.Push(ResultSuccess);
         rb.PushRaw<NodeInfo>(*node);
+
+        LOG_INFO(Service_NWM,
+                 "UDS STATE TRACE GetNodeInformation: requestedNodeId={}, returnedNodeId={}, "
+                 "friendCodeSeedNonzero={}, friendCodeSeedFingerprint=0x{:08X}, "
+                 "usernameFingerprint=0x{:08X}, nodeFingerprint=0x{:08X}",
+                 network_node_id, static_cast<u16>(node->network_node_id),
+                 static_cast<u64>(node->friend_code_seed) != 0,
+                 FingerprintFriendCodeSeed(*node), FingerprintUsername(*node),
+                 FingerprintNodeInfo(*node));
     }
     LOG_DEBUG(Service_NWM, "called");
 }
@@ -1447,10 +1859,14 @@ Result NWM_UDS::BeginHostingNetwork(std::span<const u8> network_info_buffer,
         // Room multiplayer carries plaintext WifiPacket bodies, but the retail radio encrypts
         // every data MPDU with the network's pre-shared UDS CCMP key.
         physical_data_ccmp_key = GenerateDataCCMPKey(passphrase, network_info);
+        secure_data_tx_sequence_number = 0;
         physical_tx_packet_number = 1;
         physical_tx_sequence_number = 0;
+        physical_association_request_sent = false;
+        association_response_handled = false;
         physical_rx_frame_count = 0;
         physical_rx_ccmp_failure_count = 0;
+        physical_management_reply_sequences.clear();
 
         // If the game has a preferred channel, use that instead.
         if (network_info.channel != 0)
@@ -1475,6 +1891,16 @@ Result NWM_UDS::BeginHostingNetwork(std::span<const u8> network_info_buffer,
              network_info.host_mac_address[5], static_cast<u32>(network_info.wlan_comm_id),
              network_info.id, static_cast<u32>(network_info.network_id), network_channel,
              network_info.max_nodes, application_data_size, application_fingerprint);
+
+#ifdef _WIN32
+    if (real_monitor && physical_data_ccmp_key) {
+        const u8 maximum_clients = network_info.max_nodes > 1 ? network_info.max_nodes - 1 : 1;
+        real_monitor->ConfigureAccessPoint(network_info.host_mac_address,
+                                           *physical_data_ccmp_key,
+                                           static_cast<u32>(network_info.network_id),
+                                           maximum_clients);
+    }
+#endif
 
     SignalEventAsync(connection_status_event);
 
@@ -1615,6 +2041,12 @@ Result NWM_UDS::DestroyNetworkHLE() {
     connection_status.status = NetworkStatus::NotConnected;
     connection_status.network_node_id = tmp_node_id;
     node_map.clear();
+    physical_management_reply_sequences.clear();
+#ifdef _WIN32
+    if (real_monitor) {
+        real_monitor->ResetAccessPoint();
+    }
+#endif
     SignalEventAsync(connection_status_event);
 
     for (auto& bind_node : channel_data) {
@@ -1714,11 +2146,28 @@ ResultStatus NWM_UDS::SendToHLE(u32 dest_node_id, u8 data_channel, u32 data_size
                   MaxSize);
         return ResultStatus::SendError_PacketSizeTooLarge;
     }
-    // TODO(B3N30): Increment the sequence number after each sent packet.
-    u16 sequence_number = 0;
+    const u16 sequence_number = secure_data_tx_sequence_number++;
     std::vector<u8> data_payload =
         GenerateDataPayload(input_buffer, data_channel, dest_node_id,
                             connection_status.network_node_id, sequence_number);
+    const auto generated_secure_data = ParseSecureDataHeader(data_payload);
+
+    LOG_INFO(Service_NWM,
+             "UDS DATA TRACE TX GAME: channel={}, secureSequence={}, sourceNode={}, "
+             "destinationNode={}, flags=0x{:02X}, payloadBytes={}, "
+             "payloadFingerprint=0x{:08X}, payload={}",
+             data_channel, sequence_number,
+             static_cast<u16>(connection_status.network_node_id), dest_node_id, flags, data_size,
+             FingerprintBytes(input_buffer), FormatHexBytes(input_buffer));
+    LOG_INFO(Service_NWM,
+             "UDS DATA TRACE TX SECUREDATA: channel={}, secureSequence={}, sourceNode={}, "
+             "destinationNode={}, protocolSize={}, secureDataSize={}, secureDataBytes={}, "
+             "secureDataFingerprint=0x{:08X}, secureData={}",
+             data_channel, sequence_number,
+             static_cast<u16>(connection_status.network_node_id), dest_node_id,
+             static_cast<u16>(generated_secure_data.protocol_size),
+             static_cast<u16>(generated_secure_data.securedata_size),
+             data_payload.size(), FingerprintBytes(data_payload), FormatHexBytes(data_payload));
 
     // TODO(B3N30): Use the MAC address of the dest_node_id and our own to encrypt
     // and encapsulate the payload.
@@ -1827,7 +2276,18 @@ Common::Expected<int, ResultStatus> NWM_UDS::PullPacketHLE(u32 bind_node_id, u32
     std::memcpy(output_buffer.data(),
                 next_packet.data() + sizeof(LLCHeader) + sizeof(SecureDataHeader), data_size);
 
+    const std::span<const u8> delivered_payload{output_buffer.data(), data_size};
+
     channel->second.received_packets.pop_front();
+    LOG_INFO(Service_NWM,
+             "UDS DATA TRACE RX GAME: channel={}, secureSequence={}, sourceNode={}, "
+             "destinationNode={}, payloadBytes={}, payloadFingerprint=0x{:08X}, payload={}, "
+             "remainingQueueDepth={}",
+             secure_data.data_channel, static_cast<u16>(secure_data.sequence_number),
+             static_cast<u16>(secure_data.src_node_id),
+             static_cast<u16>(secure_data.dest_node_id), data_size,
+             FingerprintBytes(delivered_payload), FormatHexBytes(delivered_payload),
+             channel->second.received_packets.size());
     return int(data_size);
 }
 
@@ -1879,11 +2339,26 @@ void NWM_UDS::ConnectToNetworkHLE(NetworkInfo net_info, u8 connection_type,
                                   std::vector<u8> passphrase) {
     network_info = net_info;
 
+    // The monitor starts on the service's default channel before the game selects a peer. Once
+    // ConnectToNetwork supplies the chosen beacon, use its advertised channel immediately rather
+    // than spending most of the IPC timeout rediscovering that same host.
+    if (network_info.channel >= 1 && network_info.channel <= 13) {
+        network_channel = network_info.channel;
+#ifdef _WIN32
+        if (real_monitor) {
+            real_monitor->SelectPeerChannel(network_channel);
+        }
+#endif
+    }
+
     conn_type = static_cast<ConnectionType>(connection_type);
 
     physical_data_ccmp_key = GenerateDataCCMPKey(passphrase, network_info);
+    secure_data_tx_sequence_number = 0;
     physical_tx_packet_number = 1;
     physical_tx_sequence_number = 0;
+    physical_association_request_sent = false;
+    association_response_handled = false;
     physical_rx_frame_count = 0;
     physical_rx_ccmp_failure_count = 0;
 
@@ -1897,9 +2372,10 @@ void NWM_UDS::ConnectToNetwork(Kernel::HLERequestContext& ctx, u16 command_id,
     NetworkInfo net_info;
     std::memcpy(&net_info, network_info_buffer.data(), network_info_buffer.size());
     ConnectToNetworkHLE(net_info, connection_type, passphrase);
-    // Originally 300 ms, but was changed to 5s to accommodate high ping
-    // Since this timing is handled by core_timing it could differ from the 'real world' time
-    static constexpr std::chrono::nanoseconds UDSConnectionTimeout{5000000000};
+    // Physical monitor creation can take several seconds before the selected channel is ready.
+    // The old five-second limit expired 31 ms before a verified retail join completed.
+    // Since this timing is handled by core_timing it could differ from real-world time.
+    static constexpr std::chrono::nanoseconds UDSConnectionTimeout{15000000000};
 
     connection_event = ctx.SleepClientThread("uds::ConnectToNetwork", UDSConnectionTimeout,
                                              std::make_shared<ThreadCallback>(command_id));
@@ -1957,6 +2433,7 @@ ResultStatus NWM_UDS::DisconnectNetworkHLE() {
         connection_status.status = NetworkStatus::NotConnected;
         connection_status.network_node_id = tmp_node_id;
         node_map.clear();
+        physical_management_reply_sequences.clear();
         SignalEventAsync(connection_status_event);
 
         deauth.channel = network_channel;
