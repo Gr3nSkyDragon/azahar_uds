@@ -238,20 +238,6 @@ void Module::Interface::UnscrambleLocalFriendCode(Kernel::HLERequestContext& ctx
             std::memcpy(unscrambled_friend_codes.data() + current * friend_code_size,
                         unscrambled.data(), friend_code_size);
         }
-        static int unscramble_logs = 0;
-        if (unscramble_logs < 80) {
-            ++unscramble_logs;
-            std::string in_hex;
-            std::string out_hex;
-            for (std::size_t i = 0; i < scrambled_friend_code_size; ++i) {
-                in_hex += fmt::format("{:02X}", scrambled_friend_codes[current * 12 + i]);
-            }
-            for (std::size_t i = 0; i < friend_code_size; ++i) {
-                out_hex += fmt::format("{:02X}", unscrambled_friend_codes[current * 8 + i]);
-            }
-            LOG_INFO(Service_FRD, "UDS DIAG: UnscrambleLocalFriendCode in={} out={}", in_hex,
-                     out_hex);
-        }
     }
 
     LOG_WARNING(Service_FRD, "(STUBBED) called");

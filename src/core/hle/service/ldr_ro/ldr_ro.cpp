@@ -2,14 +2,9 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
-#include <fstream>
-#include <set>
-#include <string>
-#include <vector>
 #include "common/alignment.h"
 #include "common/archives.h"
 #include "common/common_types.h"
-#include "common/file_util.h"
 #include "common/logging/log.h"
 #include "core/arm/arm_interface.h"
 #include "core/core.h"
@@ -17,7 +12,6 @@
 #include "core/hle/kernel/process.h"
 #include "core/hle/service/ldr_ro/cro_helper.h"
 #include "core/hle/service/ldr_ro/ldr_ro.h"
-#include "core/memory.h"
 
 SERVICE_CONSTRUCT_IMPL(Service::LDR::RO)
 SERIALIZE_EXPORT_IMPL(Service::LDR::RO)
@@ -335,25 +329,6 @@ void RO::LoadCRO(Kernel::HLERequestContext& ctx, bool link_on_load_bug_fix) {
 
     LOG_INFO(Service_LDR, "CRO \"{}\" loaded at 0x{:08X}, fixed_end=0x{:08X}", cro.ModuleName(),
              cro_address, cro_address + fix_size);
-
-    // Temporary UDS diagnostic: save the relocated image of the JoinFesta modules (Gen 7 Festival
-    // Plaza / link-trade logic) to the log folder, once per module name, for offline analysis.
-    // File format: { u32 address, u32 size, size bytes }, little-endian.
-    if (cro.ModuleName().rfind("JoinFesta", 0) == 0) {
-        static std::set<std::string> dumped_modules;
-        if (dumped_modules.insert(cro.ModuleName()).second) {
-            std::vector<u8> image(fix_size);
-            system.Memory().ReadBlock(*process, cro_address, image.data(), image.size());
-            std::ofstream file(FileUtil::GetUserPath(FileUtil::UserPath::LogDir) + "crodump_" +
-                                   cro.ModuleName(),
-                               std::ios::binary | std::ios::trunc);
-            file.write(reinterpret_cast<const char*>(&cro_address), sizeof(cro_address));
-            file.write(reinterpret_cast<const char*>(&fix_size), sizeof(fix_size));
-            file.write(reinterpret_cast<const char*>(image.data()), image.size());
-            LOG_INFO(Service_LDR, "CRO DUMP: wrote {} bytes of \"{}\" at 0x{:08X}", fix_size,
-                     cro.ModuleName(), cro_address);
-        }
-    }
 
     rb.Push(ResultSuccess, fix_size);
 }

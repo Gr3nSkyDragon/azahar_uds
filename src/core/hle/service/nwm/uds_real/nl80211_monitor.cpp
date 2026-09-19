@@ -10,7 +10,6 @@
 #include <cstddef>
 #include <cstring>
 #include <deque>
-#include <fstream>
 #include <iterator>
 #include <mutex>
 #include <optional>
@@ -23,7 +22,6 @@
 #include <vector>
 
 #include "common/common_types.h"
-#include "common/file_util.h"
 #include "common/logging/log.h"
 #include "core/hle/service/nwm/uds_real/ldnd_connection.h"
 
@@ -925,48 +923,10 @@ RadiotapSignal DescribeRadiotapSignal(const std::vector<u8>& packet) {
     return out;
 }
 
-// Temporary experiment: transmit rate for frames a client originates, read from
-// tx_rate_mbps=<n> in uds_client_experiment.txt (user directory). The file is re-read at most
-// every two seconds, so it can be changed between attempts without restarting.
-std::optional<u8> ExperimentTxRate500kbps() {
-    static std::mutex mutex;
-    static auto next_read = std::chrono::steady_clock::time_point{};
-    static std::optional<u8> cached;
-    std::scoped_lock lock{mutex};
-    const auto now = std::chrono::steady_clock::now();
-    if (now < next_read) {
-        return cached;
-    }
-    next_read = now + std::chrono::seconds(2);
-
-    std::optional<u8> value;
-    std::ifstream file(FileUtil::GetUserPath(FileUtil::UserPath::UserDir) +
-                       "uds_client_experiment.txt");
-    std::string line;
-    while (std::getline(file, line)) {
-        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) {
-            line.pop_back();
-        }
-        constexpr std::string_view Key = "tx_rate_mbps=";
-        if (line.rfind(Key, 0) != 0) {
-            continue;
-        }
-        try {
-            const double mbps = std::stod(line.substr(Key.size()));
-            const long half_mbps = std::lround(mbps * 2.0);
-            if (half_mbps >= 1 && half_mbps <= 127) {
-                value = static_cast<u8>(half_mbps);
-            }
-        } catch (...) {
-        }
-    }
-    if (value != cached) {
-        LOG_INFO(Service_NWM, "UDS Real: client data TX rate override is now {}",
-                 value ? fmt::format("{} Mbps", *value / 2.0) : std::string{"driver default"});
-    }
-    cached = value;
-    return cached;
-}
+// Transmit rate, in 500 kbps units, for game data frames a client originates (NoDS/ToDS data).
+// 11 Mbps was the rate that worked in testing: the injection default (1 Mbps) leaves a client's
+// data on the air too long, and 54 Mbps got no replies from the retail host.
+constexpr u8 ClientDataTxRate500kbps = 22;
 
 std::optional<RadiotapInfo> ParseRadiotap(const std::vector<u8>& packet) {
     if (packet.size() < 8 || packet[0] != 0 || packet[1] != 0) {
@@ -1327,7 +1287,7 @@ std::vector<u8> AddRadiotapHeader(std::span<const u8> frame, bool no_ack) {
         const bool is_data = ((frame_control >> 2) & 0x3) == 2;
         const bool from_ds = (frame_control & 0x0200) != 0;
         if (is_data && !from_ds) {
-            rate = ExperimentTxRate500kbps();
+            rate = ClientDataTxRate500kbps;
         }
     }
 

@@ -22,8 +22,6 @@
 #include "core/core_timing.h"
 #include "core/hle/ipc_helpers.h"
 #include "core/hle/kernel/event.h"
-#include "core/hle/kernel/process.h"
-#include "core/hle/kernel/thread.h"
 #include "core/hle/kernel/shared_memory.h"
 #include "core/hle/kernel/shared_page.h"
 #include "core/hle/result.h"
@@ -200,268 +198,6 @@ u64 ReadCCMPPacketNumber(std::span<const u8> header) {
            (static_cast<u64>(header[4]) << 16) | (static_cast<u64>(header[5]) << 24) |
            (static_cast<u64>(header[6]) << 32) | (static_cast<u64>(header[7]) << 40);
 }
-
-namespace {
-// Temporary diagnostic: decrypts raw MPDU captures from a passive monitor-mode observation of a
-// genuine retail-to-retail trade, reusing this build's own (already-working) CCMP key derivation
-// and frame decryption, so the result can be compared against what Azahar produces in its own
-// failed connection attempts. Runs once, triggered from NWM_UDS::Initialize.
-std::vector<u8> ParseHexColonBytesOffline(const char* hex) {
-    std::vector<u8> result;
-    std::string current;
-    for (const char* p = hex; *p; ++p) {
-        if (*p == ':') {
-            continue;
-        }
-        current += *p;
-        if (current.size() == 2) {
-            result.push_back(static_cast<u8>(std::stoul(current, nullptr, 16)));
-            current.clear();
-        }
-    }
-    return result;
-}
-
-void RunOfflineDecryptDiagnostic() {
-    static bool already_ran = false;
-    if (already_ran) {
-        return;
-    }
-    already_ran = true;
-
-    const auto passphrase =
-        ParseHexColonBytesOffline("47:4E:67:42:77:4D:63:56:6F:74:59:73:00");
-
-    NetworkInfo net_info{};
-    net_info.host_mac_address = {0x7C, 0xBB, 0x8A, 0x7A, 0xBB, 0xB7};
-    net_info.wlan_comm_id = 0x00055D10;
-    // Confirmed directly from the SSID tag of the real association request frame captured at the
-    // moment of the actual handshake (network "A9F62420", id=1) rather than the stale PSS-search
-    // beacon values (id=2, networkId=0x98E6B725) sampled much earlier in the same capture.
-    net_info.id = 1;
-    net_info.network_id = 0xA9F62420;
-
-    const DataCCMPKey key = GenerateDataCCMPKey(passphrase, net_info);
-    LOG_INFO(Service_NWM, "OFFLINE DECRYPT: derived key={}",
-             FormatHexBytes(std::vector<u8>(key.begin(), key.end())));
-
-    struct CapturedFrameSample {
-        const char* label;
-        const char* mpdu_hex;
-    };
-    static const CapturedFrameSample samples[] = {
-        {"real-handshake EAPoL frame #34 (3DSXL->2DS)",
-         "08:41:2C:00:7C:BB:8A:7A:BB:B7:B8:AE:6E:A8:D0:10:7C:BB:8A:7A:BB:B7:50:0E:00:00:00:20:"
-         "00:00:00:00:BF:0B:CB:E8:8F:3D:19:3B:29:E4:D3:5C:73:D6:6D:CF:F1:0B:57:85:BC:7D:1E:56:"
-         "24:76:4E:E9:FE:BB:AB:1D:7B:06:2D:6A:04:2A:03:B4:EA:28:4E:A2:5A:B5:EC:05:DB:42:9D:8C:"
-         "7D:3A:34:41:F9:CC:42:F7:20:4C:D7:7F"},
-        {"real-handshake EAPoL frame #35 (2DS->3DSXL)",
-         "08:42:2C:00:B8:AE:6E:A8:D0:10:7C:BB:8A:7A:BB:B7:7C:BB:8A:7A:BB:B7:70:0F:01:00:00:20:"
-         "00:00:00:00:FA:8E:57:42:B3:5C:5D:E4:B8:CA:B5:8E:7D:E0:FE:91:F9:24:14:CB:A8:6F:FE:AC:"
-         "33:B8:DB:94:34:7B:07:EE:D2:CB:15:70:F3:AB:B0:A3:15:56:B1:22:EE:9C:65:05:EA:6D:B1:C6:"
-         "08:B5:F6:B0:F2:1A:07:47:CE:76:0F:DD:41:3B:6D:12:73:F3:51:FE:02:6E:4B:7A:7E:05:24:BF:"
-         "02:A5:AF:2E:95:CA:D3:CE:F4:76:B9:B5:59:4E:40:7A:E1:8D:F6:88:CE:54:01:F3:36:EC:07:ED:"
-         "AA:32:92:94:87:DF:CD:DC:BC:BC:09:85:4E:DD:B4:6F:B5:B7:C4:0A:A3:F5:E8:70:79:57:C7:F2:"
-         "CB:D5:0F:53:E4:5A:D9:88:EC:FF:61:01:B7:38:49:94:7A:27:30:63:E9:89:83:EF:1D:DA:D5:EB:"
-         "7E:28:1B:71:54:85:71:0E:CE:24:EC:80:17:E2:CE:74:6E:7D:AB:BB:CC:27:84:88:F9:85:EC:1F:"
-         "D7:C9:8F:3A:C5:AC:DA:25:75:79:DA:8F:05:5D:12:17:5B:95:FD:2E:72:CF:DD:E6:95:3D:47:D0:"
-         "2F:1C:71:2D:2C:23:4F:FD:BA:23:2B:EA:25:FA:44:A7:40:AA:9A:95:AF:42:83:98:89:5E:CA:65:"
-         "C3:5A:DE:62:84:41:9C:3C:49:39:EF:FD:AF:CA:C9:B1:B3:B8:A7:F1:C0:55:B0:3D:43:6F:68:9E:"
-         "1D:05:26:FD:D7:F4:8D:A7:AC:86:D2:BE:66:92:F7:C6:A7:6B:FF:8B:A6:A6:5F:41:5B:17:56:22:"
-         "1A:99:20:AC:64:53:0B:E9:9E:AF:04:AE:F9:32:00:2E:5D:2F:73:9C:BA:FC:37:F7:28:4D:20:49:"
-         "0F:5B:2E:6D:6E:99:0F:BE:D3:1E:A5:48:A8:AC:DB:98:D0:20:B7:46:67:FD:D2:0A:49:70:3F:78:"
-         "B0:1F:2B:1D:53:1C:61:47:92:83:14:1A:84:E5:98:40:34:38:0D:2F:24:24:5E:AA:05:9B:BB:7D:"
-         "CF:03:F5:A6:00:29:18:F2:82:63:DA:31:CF:D2:01:DE:38:D3:C4:60:CE:81:43:23:30:C1:52:36:"
-         "6D:EB:07:D9:BB:EC:E2:F9:EE:A5:64:41:4E:0E:35:7C:CE:C2:AD:9C:A3:47:D2:4C:40:70:64:C1:"
-         "6C:10:F5:27:3F:81:06:D2:C6:B4:FE:09:6A:AC:90:26:4E:3A:34:C2:5B:00:FF:10:19:9B:0E:7F:"
-         "4A:6C:E2:F5:6D:4B:99:65:75:FE:F6:D5:ED:89:EF:73:F1:5E:4C:33:40:2A:4D:9C:95:2F:6A:C1:"
-         "81:FC:CA:51:F5:E2:32:DF:08:3B:A2:F2:C7:CC:67:C5:8C:FE:A3:04:EC:C7:46:69:C7:4A:F5:84:"
-         "C3:7F:80:E3:9A:33:C1:00:4B:69:AF:F5:2F:8A:67:9A:AE:A9:AA:47:15:08:00:96:08:EF:28:4C:"
-         "AD:6B:4A:E7:5D:EC:58:8D:06:83:E8:90:26:22:86:4C:3E:05:CD:A2:C8:B4:EF:B9:EE:D4:55:CD:"
-         "50:83:EE:DA:43:D9:49:EB:2A:FC:51:4B:3E:89:8D:CC:20:A9:80:47:41:62:5D:71:A6:CB:63:36:"
-         "67:A3:10:7E:4B:C3:E9:0E:13:5B:B2:A7:ED:B5:89:AD:76:73:06:F1:D2:65:07:0B:82:19:AD:A1:"
-         "2B:1D:34:37:6E:71:DE:C9:93:3D:35:E9:BC:76:9B:B8:99:87:A4:83:0A:CC:98:9E:89:4D:DE:82:"
-         "5A:AE:08:54:FE:E2:75:20:8D:70:E3:58"},
-    };
-
-    std::vector<std::pair<std::string, std::string>> all_samples;
-    for (const auto& sample : samples) {
-        all_samples.emplace_back(sample.label, sample.mpdu_hex);
-    }
-    // Additional frames: one "<label>\t<colon-separated MPDU hex>" per line.
-    {
-        std::ifstream extra(FileUtil::GetUserPath(FileUtil::UserPath::UserDir) +
-                            "offline_frames.txt");
-        std::string line;
-        while (std::getline(extra, line)) {
-            const auto tab = line.find('\t');
-            if (tab == std::string::npos) {
-                continue;
-            }
-            std::string hex = line.substr(tab + 1);
-            while (!hex.empty() && (hex.back() == '\r' || hex.back() == ' ')) {
-                hex.pop_back();
-            }
-            all_samples.emplace_back(line.substr(0, tab), hex);
-        }
-    }
-
-    for (const auto& [sample_label, sample_hex] : all_samples) {
-        struct {
-            const char* label;
-            const char* mpdu_hex;
-        } sample{sample_label.c_str(), sample_hex.c_str()};
-        const auto mpdu = ParseHexColonBytesOffline(sample.mpdu_hex);
-        if (mpdu.size() < 24 + 8) {
-            LOG_WARNING(Service_NWM, "OFFLINE DECRYPT [{}]: sample too short", sample.label);
-            continue;
-        }
-
-        MacAddress destination{}, source{}, bssid{};
-        std::copy(mpdu.begin() + 4, mpdu.begin() + 10, destination.begin());
-        std::copy(mpdu.begin() + 10, mpdu.begin() + 16, source.begin());
-        std::copy(mpdu.begin() + 16, mpdu.begin() + 22, bssid.begin());
-        const u16 frame_control = static_cast<u16>(mpdu[0]) | (static_cast<u16>(mpdu[1]) << 8);
-        const u16 sequence_control =
-            static_cast<u16>(mpdu[22]) | (static_cast<u16>(mpdu[23]) << 8);
-
-        const std::span<const u8> body{mpdu.data() + 24, mpdu.size() - 24};
-        const u64 packet_number = ReadCCMPPacketNumber(body.subspan(0, 8));
-        auto decrypted = DecryptDataFrame(body.subspan(8), key, source, destination, bssid,
-                                          packet_number, frame_control, sequence_control);
-        if (decrypted) {
-            LOG_INFO(Service_NWM,
-                     "OFFLINE DECRYPT SUCCESS [{}]: packetNumber={}, plaintextBytes={}, "
-                     "plaintext={}",
-                     sample.label, packet_number, decrypted->size(), FormatHexBytes(*decrypted));
-        } else {
-            LOG_WARNING(Service_NWM, "OFFLINE DECRYPT FAILED [{}]: packetNumber={}", sample.label,
-                        packet_number);
-        }
-    }
-}
-} // namespace
-
-namespace {
-// Temporary experiment knobs for the retail-hosted (Azahar as client) join. Reads simple
-// "key=value" lines ('#' starts a comment) from uds_client_experiment.txt in the user directory
-// each time a client join completes, so a variant can be changed without rebuilding or restarting.
-std::map<std::string, std::string> LoadUdsClientExperiment() {
-    std::map<std::string, std::string> values;
-    std::ifstream file(FileUtil::GetUserPath(FileUtil::UserPath::UserDir) +
-                       "uds_client_experiment.txt");
-    std::string line;
-    while (std::getline(file, line)) {
-        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) {
-            line.pop_back();
-        }
-        if (line.empty() || line.front() == '#') {
-            continue;
-        }
-        const auto equals = line.find('=');
-        if (equals == std::string::npos) {
-            continue;
-        }
-        values[line.substr(0, equals)] = line.substr(equals + 1);
-    }
-    return values;
-}
-
-std::optional<u32> ExperimentValue(const std::map<std::string, std::string>& values,
-                                   const char* key) {
-    const auto it = values.find(key);
-    if (it == values.end()) {
-        return std::nullopt;
-    }
-    try {
-        return static_cast<u32>(std::stoul(it->second, nullptr, 0));
-    } catch (...) {
-        return std::nullopt;
-    }
-}
-
-// Temporary experiment: client_data_unicast=1 sends a client's game data addressed to the host as
-// ToDS unicast (link-layer ACK + hardware retries, and ACKs become visible in the log) instead
-// of a NoDS broadcast. Re-read from uds_client_experiment.txt at most every two seconds.
-bool ClientDataUnicastExperiment() {
-    static std::mutex mutex;
-    static auto next_read = std::chrono::steady_clock::time_point{};
-    static bool cached = false;
-    std::scoped_lock lock{mutex};
-    const auto now = std::chrono::steady_clock::now();
-    if (now < next_read) {
-        return cached;
-    }
-    next_read = now + std::chrono::seconds(2);
-    const bool value = ExperimentValue(LoadUdsClientExperiment(), "client_data_unicast")
-                           .value_or(0) != 0;
-    if (value != cached) {
-        LOG_INFO(Service_NWM, "UDS EXPERIMENT: client game data unicast to host is now {}",
-                 value ? "ON" : "OFF");
-    }
-    cached = value;
-    return cached;
-}
-
-// Temporary diagnostic: scans the game's writable memory for two 8-byte patterns (the retail
-// console's ID and the ID it targets, both taken from a request beacon) and appends 0x600-byte
-// windows around each hit to memdump_<snapshot> in the log folder, so the game's parsed
-// JoinFesta person records can be inspected offline. Record format: { u32 address, u32 size,
-// bytes }, little-endian.
-void ScanGameMemoryForIds(Core::System& system, Kernel::Process& process,
-                          const std::array<std::array<u8, 8>, 3>& patterns, int snapshot) {
-    struct Range {
-        u32 begin;
-        u32 end;
-    };
-    constexpr std::array<Range, 2> Ranges{{{0x08000000, 0x0C000000}, {0x14000000, 0x1C000000}}};
-    auto& memory = system.Memory();
-    std::ofstream file(FileUtil::GetUserPath(FileUtil::UserPath::LogDir) + "memdump_" +
-                           std::to_string(snapshot),
-                       std::ios::binary | std::ios::trunc);
-    std::vector<u8> page(0x1000);
-    std::array<int, 3> hits{};
-    for (const auto& range : Ranges) {
-        for (u32 address = range.begin; address < range.end; address += 0x1000) {
-            if (!memory.IsValidVirtualAddress(process, address)) {
-                continue;
-            }
-            memory.ReadBlock(process, address, page.data(), page.size());
-            for (std::size_t p = 0; p < patterns.size(); ++p) {
-                const auto* begin = page.data();
-                const auto* end = page.data() + page.size() - 8;
-                for (const u8* at = begin; at <= end && hits[p] < 40; ++at) {
-                    if (at[0] != patterns[p][0] || std::memcmp(at, patterns[p].data(), 8) != 0) {
-                        continue;
-                    }
-                    ++hits[p];
-                    const u32 hit_address = address + static_cast<u32>(at - begin);
-                    const u32 window_start = hit_address - 0x300;
-                    std::vector<u8> window(0x600);
-                    bool ok = true;
-                    for (u32 off = 0; off < window.size() && ok; off += 0x100) {
-                        ok = memory.IsValidVirtualAddress(process, window_start + off);
-                        if (ok) {
-                            memory.ReadBlock(process, window_start + off, window.data() + off,
-                                             0x100);
-                        }
-                    }
-                    if (!ok) {
-                        continue;
-                    }
-                    const u32 size = static_cast<u32>(window.size());
-                    file.write(reinterpret_cast<const char*>(&window_start), 4);
-                    file.write(reinterpret_cast<const char*>(&size), 4);
-                    file.write(reinterpret_cast<const char*>(window.data()), window.size());
-                    LOG_INFO(Service_NWM,
-                             "UDS DIAG: memory snapshot {} pattern {} hit at 0x{:08X}", snapshot,
-                             p, hit_address);
-                }
-            }
-        }
-    }
-}
-} // namespace
 
 std::list<Network::WifiPacket> NWM_UDS::GetReceivedBeacons(const MacAddress& sender) {
     std::scoped_lock lock(beacon_mutex);
@@ -794,84 +530,9 @@ void NWM_UDS::HandleEAPoLPacket(const Network::WifiPacket& packet) {
         // Some games require ConnectToNetwork to block, for now it doesn't
         // If blocking is implemented this lock needs to be changed,
         // otherwise it might cause deadlocks
-        // Temporary experiment: optionally alter what the game sees at this moment.
-        const auto experiment = LoadUdsClientExperiment();
-        if (const auto reason = ExperimentValue(experiment, "reason")) {
-            connection_status.status_change_reason = static_cast<NetworkStatusChangeReason>(*reason);
-        }
-        if (const auto changed = ExperimentValue(experiment, "changed")) {
-            connection_status.changed_nodes = static_cast<u16>(*changed);
-        }
-        if (const auto status = ExperimentValue(experiment, "status")) {
-            connection_status.status = static_cast<NetworkStatus>(*status);
-        }
-        if (const auto node_id = ExperimentValue(experiment, "node_id")) {
-            connection_status.network_node_id = static_cast<u16>(*node_id);
-        }
-        if (const auto total = ExperimentValue(experiment, "total")) {
-            connection_status.total_nodes = static_cast<u8>(*total);
-        }
-        if (const auto max = ExperimentValue(experiment, "max")) {
-            connection_status.max_nodes = static_cast<u8>(*max);
-        }
-        if (const auto bitmask = ExperimentValue(experiment, "bitmask")) {
-            connection_status.node_bitmask = static_cast<u16>(*bitmask);
-        }
-        const auto signal_mode_it = experiment.find("signal");
-        const bool signal_status_event =
-            signal_mode_it == experiment.end() || signal_mode_it->second != "connect_only";
-        const u32 status_delay_ms = ExperimentValue(experiment, "delay_status_ms").value_or(0);
-        const auto pre_status = ExperimentValue(experiment, "pre_status");
-        const u32 pre_delay_ms = ExperimentValue(experiment, "pre_delay_ms").value_or(100);
-        LOG_INFO(Service_NWM,
-                 "UDS EXPERIMENT (client join): entries={}, status={}, reason={}, nodeId={}, "
-                 "changedNodes=0x{:04X}, total={}, max={}, bitmask=0x{:04X}, "
-                 "signalStatusEvent={}, statusDelayMs={}, preStatus={}, preDelayMs={}",
-                 experiment.size(), static_cast<u32>(connection_status.status),
-                 static_cast<u32>(connection_status.status_change_reason),
-                 static_cast<u16>(connection_status.network_node_id),
-                 static_cast<u16>(connection_status.changed_nodes), connection_status.total_nodes,
-                 connection_status.max_nodes, static_cast<u16>(connection_status.node_bitmask),
-                 signal_status_event, status_delay_ms,
-                 pre_status ? static_cast<s64>(*pre_status) : -1, pre_delay_ms);
-
         LOG_INFO(Service_NWM,
                  "UDS IPC: signaling connection_status_event and connection_event (client joined)");
-        if (pre_status) {
-            // Two-phase join: first report an intermediate status (e.g. 7 = Connecting), then the
-            // final one after a delay, waking ConnectToNetwork together with the final event.
-            const NetworkStatus final_status = connection_status.status;
-            const u16 final_changed = connection_status.changed_nodes;
-            const NetworkStatus intermediate_status = static_cast<NetworkStatus>(*pre_status);
-            connection_status.status = intermediate_status;
-            connection_status.changed_nodes = static_cast<u16>(
-                ExperimentValue(experiment, "pre_changed").value_or(0));
-            SignalEventAsync(connection_status_event);
-            std::thread([this, final_status, final_changed, intermediate_status, pre_delay_ms] {
-                std::this_thread::sleep_for(std::chrono::milliseconds(pre_delay_ms));
-                {
-                    std::scoped_lock lock(connection_status_mutex);
-                    if (connection_status.status != intermediate_status) {
-                        return;
-                    }
-                    connection_status.status = final_status;
-                    connection_status.changed_nodes = final_changed;
-                }
-                SignalEventAsync(connection_status_event);
-                SignalEventAsync(connection_event);
-            }).detach();
-            return;
-        }
-        if (signal_status_event) {
-            if (status_delay_ms == 0) {
-                SignalEventAsync(connection_status_event);
-            } else {
-                std::thread([this, event = connection_status_event, status_delay_ms] {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(status_delay_ms));
-                    SignalEventAsync(event);
-                }).detach();
-            }
-        }
+        SignalEventAsync(connection_status_event);
         SignalEventAsync(connection_event);
     } else if (connection_status.status == NetworkStatus::ConnectedAsClient ||
                connection_status.status == NetworkStatus::ConnectedAsSpectator) {
@@ -1379,8 +1040,7 @@ void NWM_UDS::SendPhysicalPacket(const Network::WifiPacket& packet) {
             packet.data.size() >= sizeof(LLCHeader) + sizeof(SecureDataHeader) &&
             GetFrameEtherType(packet.data) == EtherType::SecureData) {
             const auto header = ParseSecureDataHeader(packet.data);
-            if (!header.is_management && static_cast<u16>(header.dest_node_id) == HostDestNodeId &&
-                ClientDataUnicastExperiment()) {
+            if (!header.is_management && static_cast<u16>(header.dest_node_id) == HostDestNodeId) {
                 frame_destination = host_address;
             }
         }
@@ -1877,49 +1537,6 @@ void NWM_UDS::RecvBeaconBroadcastData(Kernel::HLERequestContext& ctx) {
 
     // Write each of the received beacons into the buffer
     for (const auto& beacon : beacons) {
-        // Temporary diagnostic: report beacons whose network-info element (Nintendo vendor IE
-        // type 0x15) carries a non-idle state byte, to see whether the game is handed the
-        // retail console's trade-request beacons.
-        {
-            static int request_beacon_logs = 0;
-            std::size_t pos = 12;
-            while (pos + 2 <= beacon.data.size()) {
-                const u8 tag = beacon.data[pos];
-                const std::size_t len = beacon.data[pos + 1];
-                if (pos + 2 + len > beacon.data.size()) {
-                    break;
-                }
-                if (tag == 221 && len >= 76 && beacon.data[pos + 2 + 3] == 0x15) {
-                    const u8* ie = beacon.data.data() + pos + 2;
-                    if (ie[73] != 2 && ie[73] != 3 && request_beacon_logs < 60) {
-                        ++request_beacon_logs;
-                        if ((request_beacon_logs == 10 || request_beacon_logs == 40) &&
-                            len >= 200) {
-                            const auto thread = ctx.ClientThread();
-                            const auto process = thread ? thread->owner_process.lock() : nullptr;
-                            if (process) {
-                                std::array<std::array<u8, 8>, 3> patterns{};
-                                std::memcpy(patterns[0].data(), ie + 60, 8);
-                                std::memcpy(patterns[1].data(), ie + 192, 8);
-                                std::memcpy(patterns[2].data(), ie + 80, 8); // Trainer name.
-                                ScanGameMemoryForIds(system, *process, patterns,
-                                                     request_beacon_logs == 10 ? 1 : 2);
-                            }
-                        }
-                        LOG_INFO(Service_NWM,
-                                 "UDS DIAG: handing non-idle beacon to the game, source={:02X}:"
-                                 "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}, state73=0x{:02X}, "
-                                 "state74=0x{:02X}, ieBytes={}",
-                                 beacon.transmitter_address[0], beacon.transmitter_address[1],
-                                 beacon.transmitter_address[2], beacon.transmitter_address[3],
-                                 beacon.transmitter_address[4], beacon.transmitter_address[5],
-                                 ie[73], ie[74], len);
-                    }
-                    break;
-                }
-                pos += 2 + len;
-            }
-        }
         BeaconEntryHeader entry{};
         // TODO(Subv): Figure out what this size is used for.
         entry.unk_size = static_cast<u32>(sizeof(BeaconEntryHeader) + beacon.data.size());
@@ -2001,7 +1618,6 @@ ResultVal<std::shared_ptr<Kernel::Event>> NWM_UDS::Initialize(
     initialized = true;
     connection_status_trace_count = 0;
 
-    RunOfflineDecryptDiagnostic();
 
     LOG_INFO(Service_NWM,
              "UDS STATE TRACE Initialize: version=0x{:04X}, nodeId={}, "

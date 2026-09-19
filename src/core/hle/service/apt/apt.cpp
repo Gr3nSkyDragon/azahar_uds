@@ -847,23 +847,6 @@ void Module::APTInterface::StartLibraryApplet(Kernel::HLERequestContext& ctx) {
 
     LOG_DEBUG(Service_APT, "called, applet_id={:08X}, size={:08X}", applet_id, buffer_size);
 
-    // Temporary UDS diagnostic: log every library applet launch. For the Error applet (0x406)
-    // the parameter block starts with {u32 type, u32 errorCode}, which names the failure the
-    // game reported.
-    {
-        u32 word0 = 0;
-        u32 word1 = 0;
-        if (buffer.size() >= 8) {
-            std::memcpy(&word0, buffer.data(), sizeof(word0));
-            std::memcpy(&word1, buffer.data() + 4, sizeof(word1));
-        }
-        LOG_INFO(Service_APT,
-                 "UDS DIAG: library applet launched, id=0x{:X}, bufferBytes={}, word0=0x{:08X}, "
-                 "word1=0x{:08X} ({})",
-                 static_cast<u32>(applet_id), buffer.size(), word0, word1,
-                 static_cast<s32>(word1));
-    }
-
     IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
     rb.Push(apt->applet_manager->StartLibraryApplet(applet_id, object, buffer));
 }
