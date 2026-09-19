@@ -7,17 +7,20 @@ This fork and its primary unique feature(s) were coded using LLM generated mater
 # How to run
 
 ### Prerequisites
-You'll need to set up ldnd.exe from [unlimitedcoder2](https://gist.github.com/unlimitedcoder2/af2f09694563c6a6cd3d3e9ec45750bd). You'll need to follow the steps in that repository to set up your USB Wi-Fi adapter (you will need a compatible USB Wi-Fi adapter). I've been using a cheap/generic AC1300 adapter in my testing.
+You'll need to set up ldnd.exe from [unlimitedcoder2](https://gist.github.com/unlimitedcoder2/af2f09694563c6a6cd3d3e9ec45750bd). You'll need to follow the steps in that repository to set up your USB Wi-Fi adapter (you will need a compatible USB Wi-Fi adapter). I've been using a cheap/generic AC1300 adapter in my testing. This is a Windows-only program. If you have experience with Linux, you can probably convert it to be Linux-compatible fairly easily. 
 
 If I haven't included an Azahar.exe in the releases, you'll need to build your own. This guide assumes you have the necessary hardware and can get ldnd.exe working on your own. 
 
-In order to trade with a retail 2/3DS, you should do the following:
+Gen 6 and 7 trading now work. I've personally confirmed the following:
+1) Trading between X and Y
+2) Trading between XY and ORAS (specifically X and AS)
+3) Trading between US and UM
 
-1) Begin searching for Passerby trainers in the PSS of your retail game before starting any programs on your computer
-2) Start ldnd.exe, then start Azahar
-3) Load into the Azahar game save, then select the retail trainer and request a trade
+Configuration doesn't matter. The emulator can request the 3DS and vice versa. You **might** run into an issue if you try to add the emulator trainer as a friend. I haven't tested adding friends much beyond one error I got due to parental controls not being set up (lol).
 
-This was written before testing in Sun/Moon/USUM and during testing of XY. Details may change for ORAS/gen7 once XY trading has been finished.
+### Trading
+In order to trade, start ldnd.exe before launching any emulator titles. Once ldnd.exe says it's ready, start your selected game in both the emulator and retail console. Navigate through the Local Wireless Trade menus to begin and complete the trade. Gen 6 uses the PSS, and Gen 7 uses the Festival Plaza.
+This mod is only designed to do local wireless trading. It isn't intended for trading over the internet. Any multiplayer features beyond trading may or may not work. I haven't tested anything other than trading at this point as that was my primary interest.
 
 ---
 
