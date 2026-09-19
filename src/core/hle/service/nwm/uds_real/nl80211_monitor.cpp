@@ -1407,9 +1407,14 @@ void RunMonitorBody(std::atomic<bool>& stop_requested,
         while (!stop_requested.load(std::memory_order_relaxed)) {
             if (const u16 selected_channel = selected_peer_channel.exchange(
                     0, std::memory_order_acq_rel);
-                selected_channel != 0 && selected_channel != current_channel) {
-                SetChannel(connection, generic_socket_id, port_id, family_id,
-                           monitor_ifindex, ChannelToFrequency(selected_channel), sequence);
+                selected_channel != 0) {
+                // Retune only if needed, but always hold the channel: when the peer is already on
+                // the monitor's current channel, skipping the hold let discovery hop away right
+                // after our authentication frame and the peer's reply was never received.
+                if (selected_channel != current_channel) {
+                    SetChannel(connection, generic_socket_id, port_id, family_id,
+                               monitor_ifindex, ChannelToFrequency(selected_channel), sequence);
+                }
                 current_channel = selected_channel;
                 if (const auto selected =
                         std::find(discovery_channels.begin(), discovery_channels.end(),
@@ -1858,6 +1863,30 @@ void RunMonitorBody(std::atomic<bool>& stop_requested,
                     const bool uses_local_bssid = frame && frame->bssid == local_address;
                     const bool uses_discovered_nintendo_bssid =
                         frame && have_nintendo_source && frame->bssid == nintendo_source;
+                    // Temporary diagnostic: record every data frame the radio sees, and whether
+                    // the delivery filter below accepts it, to tell "the host sent nothing" apart
+                    // from "we discarded what it sent".
+                    if (frame && frame->type == 2 && !from_local) {
+                        static std::size_t any_data_frame_count = 0;
+                        ++any_data_frame_count;
+                        if (any_data_frame_count <= 400) {
+                            LOG_INFO(Service_NWM,
+                                     "UDS Real: any-data RX #{}, channel={}, subtype={}, "
+                                     "protected={}, toDS={}, fromDS={}, transmitter={}, "
+                                     "destination={}, bssid={}, bodyBytes={}, retry={}, "
+                                     "passesFilter={}",
+                                     any_data_frame_count, current_channel, frame->subtype,
+                                     (frame->frame_control & 0x4000) != 0,
+                                     (frame->frame_control & 0x0100) != 0,
+                                     (frame->frame_control & 0x0200) != 0,
+                                     FormatMac(frame->transmitter_address.data()),
+                                     FormatMac(frame->destination_address.data()),
+                                     FormatMac(frame->bssid.data()), frame->body.size(),
+                                     (frame->frame_control & 0x0800) != 0,
+                                     targets_local || uses_local_bssid ||
+                                         uses_discovered_nintendo_bssid);
+                        }
+                    }
                     if (frame && !from_local &&
                         (targets_local || uses_local_bssid || uses_discovered_nintendo_bssid)) {
                         const bool is_beacon = frame->type == 0 && frame->subtype == 8;

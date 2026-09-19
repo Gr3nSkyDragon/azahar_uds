@@ -539,6 +539,8 @@ private:
     Network::MacAddress GetMacAddress();
 
     void BeaconBroadcastCallback(std::uintptr_t user_data, s64 cycles_late);
+    void ClientKeepaliveCallback(std::uintptr_t user_data, s64 cycles_late);
+    void MonitorLingerCallback(std::uintptr_t user_data, s64 cycles_late);
 
     /**
      * Returns a list of received 802.11 beacon frames from the specified sender since the last
@@ -662,6 +664,17 @@ private:
 
     // Event that will generate and send the 802.11 beacon frames.
     Core::TimingEventType* beacon_broadcast_event;
+
+    // Event that sends the periodic channel-3 keepalive a retail client sends to its host. The
+    // generation is bumped on every join/leave so a stale timer from an earlier session stops.
+    Core::TimingEventType* client_keepalive_event;
+    std::uintptr_t client_keepalive_generation = 0;
+
+    // The physical monitor takes ~2 s to bring up, and the game shuts UDS down and initializes it
+    // again every couple of seconds while searching. Instead of stopping the monitor on Shutdown,
+    // it lingers and is only stopped if no Initialize follows; the generation cancels that stop.
+    Core::TimingEventType* monitor_linger_event;
+    std::uintptr_t monitor_linger_generation = 0;
 
     // Event for handling async event signals
     Core::TimingEventType* handle_async_event_signals_event;

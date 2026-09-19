@@ -3,9 +3,12 @@
 // Refer to the license.txt file included.
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <fstream>
+#include <map>
 #include <string>
+#include <thread>
 #include <boost/serialization/list.hpp>
 #include <boost/serialization/map.hpp>
 #include <cryptopp/osrng.h>
@@ -59,6 +62,15 @@ constexpr std::size_t MaxBeaconFrames = 15;
 
 // Network node id used when a SecureData packet is addressed to every connected node.
 constexpr u16 BroadcastNetworkNodeId = 0xFFFF;
+
+// A retail client's NWM sends a one-byte management SecureData packet on channel 3 to its host
+// about every 1.1 s after joining, and the host answers each one (observed in the host-role logs).
+// Without them a retail host treats the client as gone and tears the session down.
+constexpr int ClientKeepaliveIntervalMs = 1100;
+
+// How long the physical monitor stays up after the game shuts UDS down, so a quick re-Initialize
+// (the game does this every ~2 s while searching) doesn't pay the ~2 s monitor startup again.
+constexpr int MonitorLingerMs = 60000;
 
 // The Host has always dest_node_id 1
 constexpr u16 HostDestNodeId = 1;
@@ -324,6 +336,45 @@ void RunOfflineDecryptDiagnostic() {
             LOG_WARNING(Service_NWM, "OFFLINE DECRYPT FAILED [{}]: packetNumber={}", sample.label,
                         packet_number);
         }
+    }
+}
+} // namespace
+
+namespace {
+// Temporary experiment knobs for the retail-hosted (Azahar as client) join. Reads simple
+// "key=value" lines ('#' starts a comment) from uds_client_experiment.txt in the user directory
+// each time a client join completes, so a variant can be changed without rebuilding or restarting.
+std::map<std::string, std::string> LoadUdsClientExperiment() {
+    std::map<std::string, std::string> values;
+    std::ifstream file(FileUtil::GetUserPath(FileUtil::UserPath::UserDir) +
+                       "uds_client_experiment.txt");
+    std::string line;
+    while (std::getline(file, line)) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) {
+            line.pop_back();
+        }
+        if (line.empty() || line.front() == '#') {
+            continue;
+        }
+        const auto equals = line.find('=');
+        if (equals == std::string::npos) {
+            continue;
+        }
+        values[line.substr(0, equals)] = line.substr(equals + 1);
+    }
+    return values;
+}
+
+std::optional<u32> ExperimentValue(const std::map<std::string, std::string>& values,
+                                   const char* key) {
+    const auto it = values.find(key);
+    if (it == values.end()) {
+        return std::nullopt;
+    }
+    try {
+        return static_cast<u32>(std::stoul(it->second, nullptr, 0));
+    } catch (...) {
+        return std::nullopt;
     }
 }
 } // namespace
@@ -642,6 +693,12 @@ void NWM_UDS::HandleEAPoLPacket(const Network::WifiPacket& packet) {
 
         if (conn_type == ConnectionType::Client) {
             connection_status.status = NetworkStatus::ConnectedAsClient;
+            // Start the periodic keepalive a retail client sends to its host. HandleEAPoLPacket
+            // can run off the emulation thread, hence the thread-safe scheduling mode.
+            ++client_keepalive_generation;
+            system.CoreTiming().ScheduleEvent(msToCycles(ClientKeepaliveIntervalMs),
+                                              client_keepalive_event,
+                                              client_keepalive_generation, 1, true);
         } else if (conn_type == ConnectionType::Spectator) {
             connection_status.status = NetworkStatus::ConnectedAsSpectator;
         } else {
@@ -653,9 +710,84 @@ void NWM_UDS::HandleEAPoLPacket(const Network::WifiPacket& packet) {
         // Some games require ConnectToNetwork to block, for now it doesn't
         // If blocking is implemented this lock needs to be changed,
         // otherwise it might cause deadlocks
+        // Temporary experiment: optionally alter what the game sees at this moment.
+        const auto experiment = LoadUdsClientExperiment();
+        if (const auto reason = ExperimentValue(experiment, "reason")) {
+            connection_status.status_change_reason = static_cast<NetworkStatusChangeReason>(*reason);
+        }
+        if (const auto changed = ExperimentValue(experiment, "changed")) {
+            connection_status.changed_nodes = static_cast<u16>(*changed);
+        }
+        if (const auto status = ExperimentValue(experiment, "status")) {
+            connection_status.status = static_cast<NetworkStatus>(*status);
+        }
+        if (const auto node_id = ExperimentValue(experiment, "node_id")) {
+            connection_status.network_node_id = static_cast<u16>(*node_id);
+        }
+        if (const auto total = ExperimentValue(experiment, "total")) {
+            connection_status.total_nodes = static_cast<u8>(*total);
+        }
+        if (const auto max = ExperimentValue(experiment, "max")) {
+            connection_status.max_nodes = static_cast<u8>(*max);
+        }
+        if (const auto bitmask = ExperimentValue(experiment, "bitmask")) {
+            connection_status.node_bitmask = static_cast<u16>(*bitmask);
+        }
+        const auto signal_mode_it = experiment.find("signal");
+        const bool signal_status_event =
+            signal_mode_it == experiment.end() || signal_mode_it->second != "connect_only";
+        const u32 status_delay_ms = ExperimentValue(experiment, "delay_status_ms").value_or(0);
+        const auto pre_status = ExperimentValue(experiment, "pre_status");
+        const u32 pre_delay_ms = ExperimentValue(experiment, "pre_delay_ms").value_or(100);
+        LOG_INFO(Service_NWM,
+                 "UDS EXPERIMENT (client join): entries={}, status={}, reason={}, nodeId={}, "
+                 "changedNodes=0x{:04X}, total={}, max={}, bitmask=0x{:04X}, "
+                 "signalStatusEvent={}, statusDelayMs={}, preStatus={}, preDelayMs={}",
+                 experiment.size(), static_cast<u32>(connection_status.status),
+                 static_cast<u32>(connection_status.status_change_reason),
+                 static_cast<u16>(connection_status.network_node_id),
+                 static_cast<u16>(connection_status.changed_nodes), connection_status.total_nodes,
+                 connection_status.max_nodes, static_cast<u16>(connection_status.node_bitmask),
+                 signal_status_event, status_delay_ms,
+                 pre_status ? static_cast<s64>(*pre_status) : -1, pre_delay_ms);
+
         LOG_INFO(Service_NWM,
                  "UDS IPC: signaling connection_status_event and connection_event (client joined)");
-        SignalEventAsync(connection_status_event);
+        if (pre_status) {
+            // Two-phase join: first report an intermediate status (e.g. 7 = Connecting), then the
+            // final one after a delay, waking ConnectToNetwork together with the final event.
+            const NetworkStatus final_status = connection_status.status;
+            const u16 final_changed = connection_status.changed_nodes;
+            const NetworkStatus intermediate_status = static_cast<NetworkStatus>(*pre_status);
+            connection_status.status = intermediate_status;
+            connection_status.changed_nodes = static_cast<u16>(
+                ExperimentValue(experiment, "pre_changed").value_or(0));
+            SignalEventAsync(connection_status_event);
+            std::thread([this, final_status, final_changed, intermediate_status, pre_delay_ms] {
+                std::this_thread::sleep_for(std::chrono::milliseconds(pre_delay_ms));
+                {
+                    std::scoped_lock lock(connection_status_mutex);
+                    if (connection_status.status != intermediate_status) {
+                        return;
+                    }
+                    connection_status.status = final_status;
+                    connection_status.changed_nodes = final_changed;
+                }
+                SignalEventAsync(connection_status_event);
+                SignalEventAsync(connection_event);
+            }).detach();
+            return;
+        }
+        if (signal_status_event) {
+            if (status_delay_ms == 0) {
+                SignalEventAsync(connection_status_event);
+            } else {
+                std::thread([this, event = connection_status_event, status_delay_ms] {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(status_delay_ms));
+                    SignalEventAsync(event);
+                }).detach();
+            }
+        }
         SignalEventAsync(connection_event);
     } else if (connection_status.status == NetworkStatus::ConnectedAsClient ||
                connection_status.status == NetworkStatus::ConnectedAsSpectator) {
@@ -1545,10 +1677,27 @@ boost::optional<Network::MacAddress> NWM_UDS::GetNodeMacAddress(u16 dest_node_id
     return destination->first;
 }
 
+void NWM_UDS::MonitorLingerCallback(std::uintptr_t user_data, [[maybe_unused]] s64 cycles_late) {
+#ifdef _WIN32
+    if (user_data != monitor_linger_generation || initialized) {
+        return; // UDS was initialized again since this stop was scheduled.
+    }
+    if (real_monitor && real_monitor->IsRunning()) {
+        LOG_INFO(Service_NWM, "UDS Real: stopping idle physical monitor after {} ms",
+                 MonitorLingerMs);
+        real_monitor->Stop();
+    }
+#endif
+}
+
 void NWM_UDS::ShutdownHLE() {
 #ifdef _WIN32
-    if (real_monitor) {
-        real_monitor->Stop();
+    if (real_monitor && real_monitor->IsRunning()) {
+        // Keep the monitor up for a while; see monitor_linger_event.
+        ++monitor_linger_generation;
+        system.CoreTiming().ScheduleEvent(msToCycles(MonitorLingerMs), monitor_linger_event,
+                                          monitor_linger_generation);
+        LOG_INFO(Service_NWM, "UDS Real: keeping physical monitor alive after Shutdown");
     }
 #endif
 
@@ -1739,6 +1888,10 @@ ResultVal<std::shared_ptr<Kernel::Event>> NWM_UDS::Initialize(
 #ifdef _WIN32
     if (!real_monitor) {
         real_monitor = std::make_unique<UdsReal::Nl80211Monitor>();
+    }
+    ++monitor_linger_generation; // Cancel any pending idle stop; we're using the monitor again.
+    if (real_monitor->IsRunning()) {
+        LOG_INFO(Service_NWM, "UDS Real: reusing the running physical monitor");
     }
     if (!real_monitor->IsRunning()) {
         real_monitor->Start(
@@ -2242,14 +2395,16 @@ Result NWM_UDS::DestroyNetworkHLE() {
 
     std::scoped_lock lock(connection_status_mutex);
     if (connection_status.status != NetworkStatus::ConnectedAsHost) {
-        // Pokemon's guest-side trade code calls DestroyNetwork (not DisconnectNetwork) when
-        // abandoning a connection it joined as a client, which used to leave the host with no
-        // deauth at all. Handle it the same way DisconnectNetwork does so the host actually
-        // learns we're leaving instead of silently vanishing on it.
-        LOG_INFO(Service_NWM, "called with status {}; treating as DisconnectNetwork",
+        // Only a host can destroy a network; for anyone else this must fail without touching the
+        // connection, exactly like real hardware. The game's join thread (GFLNET/PIA) calls
+        // DestroyNetwork from its cleanup step every time it finishes, including right after a
+        // successful client join, and relies on this failing harmlessly. Treating it as a
+        // disconnect here tore down every client join ~2.5 ms after it succeeded. A client
+        // that really leaves does so through DisconnectNetwork.
+        LOG_INFO(Service_NWM, "DestroyNetwork ignored: status is {}, not host",
                  static_cast<u32>(connection_status.status));
-        DisconnectNetworkHLE();
-        return ResultSuccess;
+        return Result(ErrCodes::WrongStatus, ErrorModule::UDS, ErrorSummary::InvalidState,
+                      ErrorLevel::Status);
     }
 
     using Network::WifiPacket;
@@ -2673,6 +2828,7 @@ ResultStatus NWM_UDS::DisconnectNetworkHLE() {
             node_map.clear();
             return ResultStatus::DisconError_CalledAsHost;
         }
+        ++client_keepalive_generation; // Stop any client keepalive timer.
         u16_le tmp_node_id = connection_status.network_node_id;
         connection_status = {};
         connection_status.status = NetworkStatus::NotConnected;
@@ -2902,6 +3058,42 @@ void NWM_UDS::EjectSpectators(Kernel::HLERequestContext& ctx) {
 }
 
 // Sends a 802.11 beacon frame with information about the current network.
+void NWM_UDS::ClientKeepaliveCallback(std::uintptr_t user_data, s64 cycles_late) {
+    Network::WifiPacket packet;
+    u16 sequence_number;
+    u16 source_node;
+    {
+        std::scoped_lock lock(connection_status_mutex);
+        if (connection_status.status != NetworkStatus::ConnectedAsClient ||
+            user_data != client_keepalive_generation) {
+            return; // Left the network, or a newer join owns the timer.
+        }
+        sequence_number = secure_data_tx_sequence_number++;
+        source_node = connection_status.network_node_id;
+        packet.destination_address = network_info.host_mac_address;
+        packet.channel = network_channel;
+    }
+
+    constexpr u8 KeepalivePayload = 0;
+    constexpr u16 HostNodeId = 1;
+    constexpr u8 ManagementChannel = 3;
+    packet.data = GenerateDataPayload(std::span<const u8>{&KeepalivePayload, 1}, ManagementChannel,
+                                      HostNodeId, source_node, sequence_number, true);
+    packet.type = Network::WifiPacket::PacketType::Data;
+
+    static u32 keepalive_count = 0;
+    ++keepalive_count;
+    if (keepalive_count <= 5 || keepalive_count % 20 == 0) {
+        LOG_INFO(Service_NWM,
+                 "UDS Real: client keepalive #{}, secureSequence={}, sourceNode={}, hostNode={}",
+                 keepalive_count, sequence_number, source_node, HostNodeId);
+    }
+    SendPacket(packet);
+
+    system.CoreTiming().ScheduleEvent(msToCycles(ClientKeepaliveIntervalMs) - cycles_late,
+                                      client_keepalive_event, user_data);
+}
+
 void NWM_UDS::BeaconBroadcastCallback(std::uintptr_t user_data, s64 cycles_late) {
     // Don't do anything if we're not actually hosting a network
     if (connection_status.status != NetworkStatus::ConnectedAsHost)
@@ -3031,6 +3223,16 @@ NWM_UDS::NWM_UDS(Core::System& system) : ServiceFramework("nwm::UDS"), system(sy
     beacon_broadcast_event = system.CoreTiming().RegisterEvent(
         "UDS::BeaconBroadcastCallback", [this](std::uintptr_t user_data, s64 cycles_late) {
             BeaconBroadcastCallback(user_data, cycles_late);
+        });
+
+    client_keepalive_event = system.CoreTiming().RegisterEvent(
+        "UDS::ClientKeepaliveCallback", [this](std::uintptr_t user_data, s64 cycles_late) {
+            ClientKeepaliveCallback(user_data, cycles_late);
+        });
+
+    monitor_linger_event = system.CoreTiming().RegisterEvent(
+        "UDS::MonitorLingerCallback", [this](std::uintptr_t user_data, s64 cycles_late) {
+            MonitorLingerCallback(user_data, cycles_late);
         });
 
     handle_async_event_signals_event = system.CoreTiming().RegisterEvent(

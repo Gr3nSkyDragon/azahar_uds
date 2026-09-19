@@ -3,10 +3,17 @@
 // Refer to the license.txt file included.
 
 #include <algorithm>
+#include <fstream>
+#include <set>
+#include <string>
+#include <string_view>
+#include <vector>
 #include <fmt/format.h>
 #include "common/assert.h"
+#include "common/file_util.h"
 #include "common/hacks/hack_manager.h"
 #include "common/logging/log.h"
+#include "core/arm/arm_interface.h"
 #include "core/core.h"
 #include "core/hle/ipc.h"
 #include "core/hle/kernel/client_port.h"
@@ -14,6 +21,8 @@
 #include "core/hle/kernel/process.h"
 #include "core/hle/kernel/server_port.h"
 #include "core/hle/kernel/server_session.h"
+#include "core/hle/kernel/thread.h"
+#include "core/memory.h"
 #include "core/hle/service/ac/ac.h"
 #include "core/hle/service/act/act.h"
 #include "core/hle/service/am/am.h"
@@ -175,6 +184,120 @@ void ServiceFrameworkBase::ReportUnimplementedFunction(u32* cmd_buf, const Funct
     cmd_buf[1] = 0;
 }
 
+namespace {
+// Temporary diagnostic: capture the guest code that calls into nwm::UDS, so the game's own
+// connect/status logic can be read offline. Only small windows are written, to "codedump" in the
+// log directory:
+//  - one 20 KiB window around the caller (LR) of each distinct UDS connect/status/destroy call
+//  - any extra ranges listed in codedump_ranges.txt in the user directory ("0xADDR 0xSIZE" lines),
+//    written once per session at the first UDS call
+// File format: repeated records of { u32 address, u32 size, size bytes }, little-endian.
+constexpr u32 CodeWindowBefore = 0x2000;
+constexpr u32 CodeWindowSize = 0x5000;
+
+bool AppendCodeWindow(Core::System& system, Kernel::Process& process, u32 address, u32 size) {
+    static bool file_started = false;
+    auto& memory = system.Memory();
+
+    std::vector<u8> bytes;
+    for (u32 offset = 0; offset < size;) {
+        const u32 chunk = std::min<u32>(0x1000 - ((address + offset) & 0xFFF), size - offset);
+        if (!memory.IsValidVirtualAddress(process, address + offset)) {
+            break;
+        }
+        const std::size_t old_size = bytes.size();
+        bytes.resize(old_size + chunk);
+        memory.ReadBlock(process, address + offset, bytes.data() + old_size, chunk);
+        offset += chunk;
+    }
+    if (bytes.empty()) {
+        return false;
+    }
+
+    std::ofstream file(FileUtil::GetUserPath(FileUtil::UserPath::LogDir) + "codedump",
+                       std::ios::binary | (file_started ? std::ios::app : std::ios::trunc));
+    file_started = true;
+    const u32 written = static_cast<u32>(bytes.size());
+    file.write(reinterpret_cast<const char*>(&address), sizeof(address));
+    file.write(reinterpret_cast<const char*>(&written), sizeof(written));
+    file.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    LOG_INFO(Service_NWM, "UDS CODEDUMP: wrote window address=0x{:08X}, bytes={}", address,
+             written);
+    return true;
+}
+
+void CaptureUdsCallerCode(Kernel::HLERequestContext& context, std::string_view function_name) {
+    static bool extra_ranges_done = false;
+    static std::set<u32> dumped_pages;
+
+    const bool is_interesting =
+        function_name == "ConnectToNetwork" || function_name == "GetConnectionStatus" ||
+        function_name == "DestroyNetwork" || function_name == "DisconnectNetwork";
+    const bool is_first_call = !extra_ranges_done;
+    if (!is_interesting && !is_first_call) {
+        return;
+    }
+
+    auto& system = Core::System::GetInstance();
+    const auto thread = context.ClientThread();
+    const auto process = thread ? thread->owner_process.lock() : nullptr;
+    if (!process) {
+        return;
+    }
+
+    if (is_first_call) {
+        extra_ranges_done = true;
+        std::ifstream ranges(FileUtil::GetUserPath(FileUtil::UserPath::UserDir) +
+                             "codedump_ranges.txt");
+        std::string address_text;
+        std::string size_text;
+        while (ranges >> address_text >> size_text) {
+            try {
+                AppendCodeWindow(system, *process,
+                                 static_cast<u32>(std::stoul(address_text, nullptr, 0)),
+                                 static_cast<u32>(std::stoul(size_text, nullptr, 0)));
+            } catch (...) {
+                break;
+            }
+        }
+    }
+    if (!is_interesting) {
+        return;
+    }
+
+    auto& core = system.GetRunningCore();
+    const u32 pc = core.GetPC();
+    const u32 lr = core.GetReg(14) & ~1u;
+    const u32 sp = core.GetReg(13);
+
+    // Candidate return addresses further up the call chain: stack words that point into the
+    // code range (0x00100000-0x00800000).
+    std::string stack_code_pointers;
+    auto& memory = system.Memory();
+    int found = 0;
+    for (u32 slot = 0; slot < 96 && found < 24; ++slot) {
+        const u32 slot_address = sp + slot * 4;
+        if (!memory.IsValidVirtualAddress(*process, slot_address)) {
+            break;
+        }
+        u32 word = 0;
+        memory.ReadBlock(*process, slot_address, &word, sizeof(word));
+        if ((word & ~1u) >= 0x00100000 && (word & ~1u) < 0x00800000) {
+            stack_code_pointers += fmt::format("{}0x{:08X}", found ? "," : "", word);
+            ++found;
+        }
+    }
+    LOG_INFO(Service_NWM,
+             "UDS CALLER: function '{}' pc=0x{:08X} lr=0x{:08X} sp=0x{:08X} stackCodePointers=[{}]",
+             function_name, pc, lr, sp, stack_code_pointers);
+
+    const u32 page = lr & ~0xFFFu;
+    if (lr >= 0x00100000 && lr < 0x00800000 && dumped_pages.insert(page).second) {
+        AppendCodeWindow(system, *process, page - CodeWindowBefore, CodeWindowSize);
+    }
+}
+} // namespace
+
 void ServiceFrameworkBase::HandleSyncRequest(Kernel::HLERequestContext& context) {
     auto itr = handlers.find(context.CommandHeader().command_id.Value());
     const FunctionInfoBase* info = itr == handlers.end() ? nullptr : &itr->second;
@@ -190,6 +313,7 @@ void ServiceFrameworkBase::HandleSyncRequest(Kernel::HLERequestContext& context)
     if (GetServiceName() == "nwm::UDS") {
         LOG_INFO(Service_NWM, "UDS IPC: {}",
                  MakeFunctionString(info->name, GetServiceName(), context.CommandBuffer()));
+        CaptureUdsCallerCode(context, info->name);
     }
     handler_invoker(this, info->handler_callback, context);
 }
