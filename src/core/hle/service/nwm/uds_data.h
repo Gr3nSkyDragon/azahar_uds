@@ -45,10 +45,13 @@ static_assert(sizeof(LLCHeader) == 8, "LLCHeader has the wrong size");
  * the source and destination network node ids.
  */
 struct SecureDataHeader {
-    // TODO(Subv): It is likely that the first 4 bytes of this header are
-    // actually part of another container protocol.
+    // The first 4 bytes are a container header: the total size of everything that follows the LLC
+    // header, and the number of SecureData packets aggregated into this frame. Real hardware sends
+    // 1 for an ordinary frame (decrypted from a genuine retail trade capture) and may bundle several
+    // packets into one frame; a count of 0 makes a retail console ignore the frame entirely. Only the
+    // first packet's fields follow in this struct; later packets repeat securedata_size onward.
     u16_be protocol_size;
-    INSERT_PADDING_BYTES(2);
+    u16_be packet_count;
     u16_be securedata_size;
     u8 is_management;
     u8 data_channel;
@@ -94,8 +97,11 @@ constexpr u16 EAPoLStartMagic = 0x201;
 struct EAPoLStartPacket {
     u16_be magic = EAPoLStartMagic;
     u16_be association_id;
-    enum_le<ConnectionType> connection_type;
-    INSERT_PADDING_BYTES(3);
+    // Real hardware transmits this as a full big-endian u16 (value only ever 0-3; the parser on a
+    // retail 3DS errors out otherwise), not as a single byte. Store it as a raw integer here and
+    // convert to/from ConnectionType at the call sites.
+    u16_be connection_type;
+    INSERT_PADDING_BYTES(2);
     EAPoLNodeInfo node;
 };
 

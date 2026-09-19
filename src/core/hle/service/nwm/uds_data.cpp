@@ -42,9 +42,9 @@ static std::vector<u8> GenerateSecureDataHeader(u16 data_size, u8 channel, u16 d
                                                 bool is_management) {
     SecureDataHeader header{};
     header.protocol_size = data_size + sizeof(SecureDataHeader);
-    // Note: This size includes everything except the first 4 bytes of the structure,
-    // reinforcing the hypotheses that the first 4 bytes are actually the header of
-    // another container protocol.
+    header.packet_count = 1;
+    // Note: This size includes everything except the first 4 bytes of the structure (the container
+    // header made of protocol_size and packet_count).
     header.securedata_size = data_size + sizeof(SecureDataHeader) - 4;
     header.is_management = is_management ? 1 : 0;
     header.data_channel = channel;
@@ -293,19 +293,30 @@ std::vector<u8> GenerateEAPoLStartFrame(u16 association_id, ConnectionType conn_
                                         const NodeInfo& node_info) {
     EAPoLStartPacket eapol_start{};
     eapol_start.association_id = association_id;
-    eapol_start.connection_type = conn_type;
+    eapol_start.connection_type = static_cast<u16>(conn_type);
     eapol_start.node.friend_code_seed = node_info.friend_code_seed;
 
     std::copy(node_info.username.begin(), node_info.username.end(),
               eapol_start.node.username.begin());
 
-    // Note: The network_node_id and unknown bytes seem to be uninitialized in the NWM module.
-    // TODO(B3N30): The last 8 bytes seem to have a fixed value of 07 88 15 00 04 e9 13 00 in
-    // EAPoL-Start packets from different 3DSs to the same host during a Super Smash Bros. 4 game.
-    // Find out what that means.
-
     std::vector<u8> eapol_buffer(sizeof(EAPoLStartPacket));
     std::memcpy(eapol_buffer.data(), &eapol_start, sizeof(eapol_start));
+
+    // These two spans are declared as padding in our struct, but real retail hardware does not
+    // leave them zeroed. A genuine retail-to-retail capture confirmed offset 6-7 is 01:00, and the
+    // node info's trailing 6 bytes are 15:00:04:E9:13:00 -- matching (for the trailing bytes) a
+    // previously unexplained fixed pattern already noted below from a capture of a different game
+    // (Super Smash Bros 4) on different hardware, strongly suggesting this is a fixed
+    // firmware/NWM-module constant rather than anything game- or console-specific. Neither field
+    // has a known name yet, so the raw offsets are used directly.
+    // Historical note this now explains: "the last 8 bytes seem to have a fixed value of
+    // 07 88 15 00 04 e9 13 00 in EAPoL-Start packets from different 3DSs to the same host during a
+    // Super Smash Bros. 4 game" -- the last 6 of those 8 bytes match exactly.
+    eapol_buffer[6] = 0x01;
+    eapol_buffer[7] = 0x00;
+    static constexpr std::array<u8, 6> UnknownFixedNodeTrailer{0x15, 0x00, 0x04, 0xE9, 0x13, 0x00};
+    std::copy(UnknownFixedNodeTrailer.begin(), UnknownFixedNodeTrailer.end(),
+              eapol_buffer.begin() + 42);
 
     std::vector<u8> buffer = GenerateLLCHeader(EtherType::EAPoL);
     buffer.reserve(buffer.size() + sizeof(EAPoLStartPacket));

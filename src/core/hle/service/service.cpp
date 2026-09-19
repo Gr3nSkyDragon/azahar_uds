@@ -185,6 +185,12 @@ void ServiceFrameworkBase::HandleSyncRequest(Kernel::HLERequestContext& context)
 
     LOG_TRACE(Service, "{}",
               MakeFunctionString(info->name, GetServiceName(), context.CommandBuffer()));
+    // Temporary diagnostic: record every nwm::UDS command the game issues, in order, so the exact
+    // IPC sequence around a connect/destroy can be reconstructed from the log.
+    if (GetServiceName() == "nwm::UDS") {
+        LOG_INFO(Service_NWM, "UDS IPC: {}",
+                 MakeFunctionString(info->name, GetServiceName(), context.CommandBuffer()));
+    }
     handler_invoker(this, info->handler_callback, context);
 }
 

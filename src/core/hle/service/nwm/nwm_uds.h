@@ -716,6 +716,16 @@ private:
     // Last management sequence answered for each physical client. Monitor-mode capture receives
     // every 802.11 retransmission, but a UDS management request must only be answered once.
     std::map<u16, u16> physical_management_reply_sequences;
+    // Last EAPoL frame processed from each physical transmitter. Monitor-mode capture delivers
+    // every 802.11 retransmission as a separate frame; reprocessing an identical EAPoL-Logoff
+    // corrupts connection_status.changed_nodes (it gets XORed against the state it just set,
+    // going back to zero) even though real node changes happened.
+    std::map<Network::MacAddress, std::vector<u8>> last_eapol_frame_data;
+    // max_nodes from the beacon we actually scanned and selected via ConnectToNetwork. Real retail
+    // hardware's EAPoL-Logoff reports a different max_nodes than its own beacon does; expose the
+    // beacon's value to the game via GetConnectionStatus instead, since that's the value the game
+    // already validated when it chose this network.
+    u8 beacon_max_nodes{};
 
     template <class Archive>
     void serialize(Archive& ar, const unsigned int);
