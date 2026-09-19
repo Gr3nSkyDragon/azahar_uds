@@ -87,6 +87,22 @@ void Module::Interface::GetFriendAttributeFlags(Kernel::HLERequestContext& ctx) 
 }
 
 void Module::Interface::GetMyFriendKey(Kernel::HLERequestContext& ctx) {
+    // An all-zero key means "no friend code registered". Games that identify themselves to local
+    // peers by this key (e.g. Pokemon Festival Plaza trade requests, which compare the request's
+    // target key against our own and reject zero keys) then can never match. Derive a stable,
+    // non-zero identity from the console's unique ID instead.
+    if (frd->my_friend_key.friend_id == 0 && frd->my_friend_key.friend_code == 0) {
+        const u64 console_id = Service::CFG::GetModule(frd->system)->GetConsoleUniqueId();
+        u32 principal_id = static_cast<u32>((console_id >> 3) ^ (console_id >> 35)) & 0x3FFFFFFF;
+        if (principal_id == 0) {
+            principal_id = 1;
+        }
+        frd->my_friend_key.friend_id = principal_id;
+        frd->my_friend_key.friend_code = console_id != 0 ? console_id : principal_id;
+        LOG_INFO(Service_FRD, "Generated friend key: principalId=0x{:08X}, code=0x{:016X}",
+                 frd->my_friend_key.friend_id, frd->my_friend_key.friend_code);
+    }
+
     IPC::RequestParser rp(ctx);
     IPC::RequestBuilder rb = rp.MakeBuilder(5, 0);
     rb.Push(ResultSuccess);
@@ -202,19 +218,41 @@ void Module::Interface::UnscrambleLocalFriendCode(Kernel::HLERequestContext& ctx
                "Wrong input buffer size");
 
     std::vector<u8> unscrambled_friend_codes(friend_code_count * friend_code_size, 0);
-    // TODO(B3N30): Unscramble the codes and compare them against the friend list
-    //              Only write 0 if the code isn't in friend list, otherwise write the
-    //              unscrambled one
-    //
-    // Code for unscrambling (should be compared to HW):
-    // std::array<u16, 6> scambled_friend_code;
-    // Memory::ReadBlock(scrambled_friend_codes+(current*scrambled_friend_code_size),
-    // scambled_friend_code.data(), scrambled_friend_code_size); std::array<u16, 4>
-    // unscrambled_friend_code; unscrambled_friend_code[0] = scambled_friend_code[0] ^
-    // scambled_friend_code[5]; unscrambled_friend_code[1] = scambled_friend_code[1] ^
-    // scambled_friend_code[5]; unscrambled_friend_code[2] = scambled_friend_code[2] ^
-    // scambled_friend_code[5]; unscrambled_friend_code[3] = scambled_friend_code[3] ^
-    // scambled_friend_code[5];
+    // Each scrambled code is six little-endian u16 words; the first four are the code XORed with
+    // the sixth. Returning zeros for every input (the old stub) gives all peers the same all-zero
+    // identity, so games that key their guest/person lists by this value (Pokemon Festival Plaza)
+    // cannot tell peers apart or match a trade request's target to themselves. An all-zero input
+    // stays zero ("no code").
+    for (u32 current = 0; current < friend_code_count; ++current) {
+        std::array<u16, 6> scrambled{};
+        std::memcpy(scrambled.data(),
+                    scrambled_friend_codes.data() + current * scrambled_friend_code_size,
+                    scrambled_friend_code_size);
+        std::array<u16, 4> unscrambled{};
+        bool any_nonzero = false;
+        for (std::size_t i = 0; i < unscrambled.size(); ++i) {
+            unscrambled[i] = static_cast<u16>(scrambled[i] ^ scrambled[5]);
+            any_nonzero |= scrambled[i] != 0;
+        }
+        if (any_nonzero) {
+            std::memcpy(unscrambled_friend_codes.data() + current * friend_code_size,
+                        unscrambled.data(), friend_code_size);
+        }
+        static int unscramble_logs = 0;
+        if (unscramble_logs < 80) {
+            ++unscramble_logs;
+            std::string in_hex;
+            std::string out_hex;
+            for (std::size_t i = 0; i < scrambled_friend_code_size; ++i) {
+                in_hex += fmt::format("{:02X}", scrambled_friend_codes[current * 12 + i]);
+            }
+            for (std::size_t i = 0; i < friend_code_size; ++i) {
+                out_hex += fmt::format("{:02X}", unscrambled_friend_codes[current * 8 + i]);
+            }
+            LOG_INFO(Service_FRD, "UDS DIAG: UnscrambleLocalFriendCode in={} out={}", in_hex,
+                     out_hex);
+        }
+    }
 
     LOG_WARNING(Service_FRD, "(STUBBED) called");
     IPC::RequestBuilder rb = rp.MakeBuilder(1, 2);

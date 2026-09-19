@@ -22,6 +22,8 @@
 #include "core/core_timing.h"
 #include "core/hle/ipc_helpers.h"
 #include "core/hle/kernel/event.h"
+#include "core/hle/kernel/process.h"
+#include "core/hle/kernel/thread.h"
 #include "core/hle/kernel/shared_memory.h"
 #include "core/hle/kernel/shared_page.h"
 #include "core/hle/result.h"
@@ -375,6 +377,88 @@ std::optional<u32> ExperimentValue(const std::map<std::string, std::string>& val
         return static_cast<u32>(std::stoul(it->second, nullptr, 0));
     } catch (...) {
         return std::nullopt;
+    }
+}
+
+// Temporary experiment: client_data_unicast=1 sends a client's game data addressed to the host as
+// ToDS unicast (link-layer ACK + hardware retries, and ACKs become visible in the log) instead
+// of a NoDS broadcast. Re-read from uds_client_experiment.txt at most every two seconds.
+bool ClientDataUnicastExperiment() {
+    static std::mutex mutex;
+    static auto next_read = std::chrono::steady_clock::time_point{};
+    static bool cached = false;
+    std::scoped_lock lock{mutex};
+    const auto now = std::chrono::steady_clock::now();
+    if (now < next_read) {
+        return cached;
+    }
+    next_read = now + std::chrono::seconds(2);
+    const bool value = ExperimentValue(LoadUdsClientExperiment(), "client_data_unicast")
+                           .value_or(0) != 0;
+    if (value != cached) {
+        LOG_INFO(Service_NWM, "UDS EXPERIMENT: client game data unicast to host is now {}",
+                 value ? "ON" : "OFF");
+    }
+    cached = value;
+    return cached;
+}
+
+// Temporary diagnostic: scans the game's writable memory for two 8-byte patterns (the retail
+// console's ID and the ID it targets, both taken from a request beacon) and appends 0x600-byte
+// windows around each hit to memdump_<snapshot> in the log folder, so the game's parsed
+// JoinFesta person records can be inspected offline. Record format: { u32 address, u32 size,
+// bytes }, little-endian.
+void ScanGameMemoryForIds(Core::System& system, Kernel::Process& process,
+                          const std::array<std::array<u8, 8>, 3>& patterns, int snapshot) {
+    struct Range {
+        u32 begin;
+        u32 end;
+    };
+    constexpr std::array<Range, 2> Ranges{{{0x08000000, 0x0C000000}, {0x14000000, 0x1C000000}}};
+    auto& memory = system.Memory();
+    std::ofstream file(FileUtil::GetUserPath(FileUtil::UserPath::LogDir) + "memdump_" +
+                           std::to_string(snapshot),
+                       std::ios::binary | std::ios::trunc);
+    std::vector<u8> page(0x1000);
+    std::array<int, 3> hits{};
+    for (const auto& range : Ranges) {
+        for (u32 address = range.begin; address < range.end; address += 0x1000) {
+            if (!memory.IsValidVirtualAddress(process, address)) {
+                continue;
+            }
+            memory.ReadBlock(process, address, page.data(), page.size());
+            for (std::size_t p = 0; p < patterns.size(); ++p) {
+                const auto* begin = page.data();
+                const auto* end = page.data() + page.size() - 8;
+                for (const u8* at = begin; at <= end && hits[p] < 40; ++at) {
+                    if (at[0] != patterns[p][0] || std::memcmp(at, patterns[p].data(), 8) != 0) {
+                        continue;
+                    }
+                    ++hits[p];
+                    const u32 hit_address = address + static_cast<u32>(at - begin);
+                    const u32 window_start = hit_address - 0x300;
+                    std::vector<u8> window(0x600);
+                    bool ok = true;
+                    for (u32 off = 0; off < window.size() && ok; off += 0x100) {
+                        ok = memory.IsValidVirtualAddress(process, window_start + off);
+                        if (ok) {
+                            memory.ReadBlock(process, window_start + off, window.data() + off,
+                                             0x100);
+                        }
+                    }
+                    if (!ok) {
+                        continue;
+                    }
+                    const u32 size = static_cast<u32>(window.size());
+                    file.write(reinterpret_cast<const char*>(&window_start), 4);
+                    file.write(reinterpret_cast<const char*>(&size), 4);
+                    file.write(reinterpret_cast<const char*>(window.data()), window.size());
+                    LOG_INFO(Service_NWM,
+                             "UDS DIAG: memory snapshot {} pattern {} hit at 0x{:08X}", snapshot,
+                             p, hit_address);
+                }
+            }
+        }
     }
 }
 } // namespace
@@ -1290,7 +1374,17 @@ void NWM_UDS::SendPhysicalPacket(const Network::WifiPacket& packet) {
         const bool from_ds = status == NetworkStatus::ConnectedAsHost;
         const u64 packet_number = physical_tx_packet_number++;
         const u16 dot11_sequence = physical_tx_sequence_number++;
-        frame = GeneratePhysicalDataFrame(packet.data, *ccmp_key, transmitter, destination,
+        MacAddress frame_destination = destination;
+        if (status == NetworkStatus::ConnectedAsClient && destination == Network::BroadcastMac &&
+            packet.data.size() >= sizeof(LLCHeader) + sizeof(SecureDataHeader) &&
+            GetFrameEtherType(packet.data) == EtherType::SecureData) {
+            const auto header = ParseSecureDataHeader(packet.data);
+            if (!header.is_management && static_cast<u16>(header.dest_node_id) == HostDestNodeId &&
+                ClientDataUnicastExperiment()) {
+                frame_destination = host_address;
+            }
+        }
+        frame = GeneratePhysicalDataFrame(packet.data, *ccmp_key, transmitter, frame_destination,
                                           host_address, from_ds, packet_number, dot11_sequence);
 
         if (packet.data.size() >= sizeof(LLCHeader) &&
@@ -1366,28 +1460,12 @@ void NWM_UDS::SendPhysicalPacket(const Network::WifiPacket& packet) {
 #endif
 }
 
-void NWM_UDS::SendPhysicalAssociationRequest(const MacAddress& host_address) {
-#ifdef _WIN32
-    if (!real_monitor || !real_monitor->IsRunning()) {
-        return;
-    }
-
-    u32 network_id{};
-    u8 channel{};
-    {
-        std::scoped_lock lock{connection_status_mutex};
-        if (connection_status.status != NetworkStatus::Connecting) {
-            return;
-        }
-        network_id = static_cast<u32>(network_info.network_id);
-        channel = network_channel;
-    }
-
-    // Retail Pokemon X association request captured on the air:
-    //   capability=0x0431, listen interval=1
-    //   SSID=<network id as eight uppercase hexadecimal characters>
-    //   supported rates=82 84 8B 0C 12 96 18 24
-    //   extended rates=30 48 60 6C
+// Retail Pokemon X association request captured on the air:
+//   capability=0x0431, listen interval=1
+//   SSID=<network id as eight uppercase hexadecimal characters>
+//   supported rates=82 84 8B 0C 12 96 18 24
+//   extended rates=30 48 60 6C
+static std::vector<u8> GenerateAssociationRequestBody(u32 network_id) {
     std::vector<u8> body;
     body.reserve(30);
     AppendU16(body, 0x0431);
@@ -1409,6 +1487,27 @@ void NWM_UDS::SendPhysicalAssociationRequest(const MacAddress& host_address) {
     body.push_back(50); // Extended Supported Rates.
     body.push_back(static_cast<u8>(ExtendedRates.size()));
     body.insert(body.end(), ExtendedRates.begin(), ExtendedRates.end());
+    return body;
+}
+
+void NWM_UDS::SendPhysicalAssociationRequest(const MacAddress& host_address) {
+#ifdef _WIN32
+    if (!real_monitor || !real_monitor->IsRunning()) {
+        return;
+    }
+
+    u32 network_id{};
+    u8 channel{};
+    {
+        std::scoped_lock lock{connection_status_mutex};
+        if (connection_status.status != NetworkStatus::Connecting) {
+            return;
+        }
+        network_id = static_cast<u32>(network_info.network_id);
+        channel = network_channel;
+    }
+
+    const std::vector<u8> body = GenerateAssociationRequestBody(network_id);
 
     const MacAddress transmitter = GetMacAddress();
     const u16 dot11_sequence = physical_tx_sequence_number++;
@@ -1778,6 +1877,49 @@ void NWM_UDS::RecvBeaconBroadcastData(Kernel::HLERequestContext& ctx) {
 
     // Write each of the received beacons into the buffer
     for (const auto& beacon : beacons) {
+        // Temporary diagnostic: report beacons whose network-info element (Nintendo vendor IE
+        // type 0x15) carries a non-idle state byte, to see whether the game is handed the
+        // retail console's trade-request beacons.
+        {
+            static int request_beacon_logs = 0;
+            std::size_t pos = 12;
+            while (pos + 2 <= beacon.data.size()) {
+                const u8 tag = beacon.data[pos];
+                const std::size_t len = beacon.data[pos + 1];
+                if (pos + 2 + len > beacon.data.size()) {
+                    break;
+                }
+                if (tag == 221 && len >= 76 && beacon.data[pos + 2 + 3] == 0x15) {
+                    const u8* ie = beacon.data.data() + pos + 2;
+                    if (ie[73] != 2 && ie[73] != 3 && request_beacon_logs < 60) {
+                        ++request_beacon_logs;
+                        if ((request_beacon_logs == 10 || request_beacon_logs == 40) &&
+                            len >= 200) {
+                            const auto thread = ctx.ClientThread();
+                            const auto process = thread ? thread->owner_process.lock() : nullptr;
+                            if (process) {
+                                std::array<std::array<u8, 8>, 3> patterns{};
+                                std::memcpy(patterns[0].data(), ie + 60, 8);
+                                std::memcpy(patterns[1].data(), ie + 192, 8);
+                                std::memcpy(patterns[2].data(), ie + 80, 8); // Trainer name.
+                                ScanGameMemoryForIds(system, *process, patterns,
+                                                     request_beacon_logs == 10 ? 1 : 2);
+                            }
+                        }
+                        LOG_INFO(Service_NWM,
+                                 "UDS DIAG: handing non-idle beacon to the game, source={:02X}:"
+                                 "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}, state73=0x{:02X}, "
+                                 "state74=0x{:02X}, ieBytes={}",
+                                 beacon.transmitter_address[0], beacon.transmitter_address[1],
+                                 beacon.transmitter_address[2], beacon.transmitter_address[3],
+                                 beacon.transmitter_address[4], beacon.transmitter_address[5],
+                                 ie[73], ie[74], len);
+                    }
+                    break;
+                }
+                pos += 2 + len;
+            }
+        }
         BeaconEntryHeader entry{};
         // TODO(Subv): Figure out what this size is used for.
         entry.unk_size = static_cast<u32>(sizeof(BeaconEntryHeader) + beacon.data.size());
@@ -2762,6 +2904,20 @@ void NWM_UDS::ConnectToNetworkHLE(NetworkInfo net_info, u8 connection_type,
     physical_rx_frame_count = 0;
     physical_rx_ccmp_failure_count = 0;
 
+#ifdef _WIN32
+    if (real_monitor) {
+        // The retail host's unicast frames to us need immediate hardware ACKs, which a passive
+        // monitor cannot send. Bring up the ACK shell with our own address before anything is
+        // transmitted, and register the host so it is acknowledged from its first frame.
+        const std::vector<u8> association_body =
+            GenerateAssociationRequestBody(static_cast<u32>(network_info.network_id));
+        real_monitor->ConfigureClientAckShell(GetMacAddress(), network_info.host_mac_address,
+                                              static_cast<u32>(network_info.network_id),
+                                              association_body);
+        LOG_INFO(Service_NWM, "UDS Real: client ACK shell requested for retail host");
+    }
+#endif
+
     // Start the connection sequence
     StartConnectionSequence(network_info.host_mac_address);
 }
@@ -2837,6 +2993,11 @@ ResultStatus NWM_UDS::DisconnectNetworkHLE() {
         physical_management_reply_sequences.clear();
         last_eapol_frame_data.clear();
         SignalEventAsync(connection_status_event);
+#ifdef _WIN32
+        if (real_monitor) {
+            real_monitor->ResetAccessPoint(); // Tear down the client ACK shell.
+        }
+#endif
 
         deauth.channel = network_channel;
         deauth.data = {0x03, 0x00}; // Reason: station is leaving.

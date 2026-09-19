@@ -99,6 +99,17 @@ public:
     // Removes a departing retail station from the kernel table, if it was registered.
     void RemoveAccessPointStation(const std::array<u8, 6>& station_address);
 
+    // Client-role counterpart of the ACK shell. When Azahar joins a retail-hosted network, the
+    // retail host's unicast frames to us (authentication/association responses, EAPoL-Logoff,
+    // keepalive replies) need immediate hardware ACKs or the host gives up on the join. This
+    // prepares the same companion AP interface, but with OUR address, brings it up with a
+    // minimal non-Nintendo hidden beacon (never advertised as a UDS network), and registers the
+    // retail host as a station so the firmware acknowledges its frames. association_body is the
+    // body of our own association request (capability, listen interval, SSID, rates).
+    void ConfigureClientAckShell(const std::array<u8, 6>& own_address,
+                                 const std::array<u8, 6>& host_address, u32 network_id,
+                                 std::span<const u8> association_body);
+
     // Stops the AP portion while leaving physical discovery running.
     void ResetAccessPoint();
 

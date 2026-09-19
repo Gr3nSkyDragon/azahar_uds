@@ -10,9 +10,11 @@
 #include <cstddef>
 #include <cstring>
 #include <deque>
+#include <fstream>
 #include <iterator>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -21,6 +23,7 @@
 #include <vector>
 
 #include "common/common_types.h"
+#include "common/file_util.h"
 #include "common/logging/log.h"
 #include "core/hle/service/nwm/uds_real/ldnd_connection.h"
 
@@ -117,6 +120,9 @@ static_assert(NintendoContinuousScanSsid.size() == 32);
 struct PhysicalBeaconSnapshot {
     std::vector<u8> body;
     std::array<u8, 6> host_address{};
+    // True for the minimal beacon used only to bring up the client-role ACK shell: it is never
+    // transmitted as a raw Nintendo beacon and never treated as a hosted network.
+    bool ack_shell_only{};
 };
 
 struct AccessPointConfiguration {
@@ -836,6 +842,132 @@ struct ProbeFrameDiagnostic {
     std::vector<u8> ssid;
 };
 
+// Per-frame radio details from a captured radiotap header: transmit/receive rate, signal strength
+// and channel. Only used to log link quality; unknown or malformed fields are simply left empty.
+struct RadiotapSignal {
+    std::optional<u8> rate_500kbps;
+    std::optional<s8> signal_dbm;
+    std::optional<u16> channel_mhz;
+    std::optional<std::array<u8, 3>> mcs;
+};
+
+RadiotapSignal DescribeRadiotapSignal(const std::vector<u8>& packet) {
+    RadiotapSignal out;
+    if (packet.size() < 8 || packet[0] != 0) {
+        return out;
+    }
+    const std::size_t length = ReadU16(packet.data() + 2);
+    if (length < 8 || length > packet.size()) {
+        return out;
+    }
+    std::size_t present_offset = 4;
+    u32 first_present = 0;
+    bool have_first = false;
+    for (;;) {
+        if (present_offset + 4 > length) {
+            return out;
+        }
+        const u32 present = ReadU32(packet.data() + present_offset);
+        if (!have_first) {
+            first_present = present;
+            have_first = true;
+        }
+        present_offset += 4;
+        if ((present & (1U << 31)) == 0) {
+            break;
+        }
+    }
+
+    std::size_t offset = present_offset;
+    // Returns the offset of a present field (after alignment) and advances past it.
+    const auto field = [&](unsigned bit, std::size_t align,
+                           std::size_t size) -> std::optional<std::size_t> {
+        if ((first_present & (1U << bit)) == 0) {
+            return std::nullopt;
+        }
+        offset = (offset + align - 1) & ~(align - 1);
+        if (offset + size > length) {
+            offset = length + 1;
+            return std::nullopt;
+        }
+        const std::size_t at = offset;
+        offset += size;
+        return at;
+    };
+    field(0, 8, 8); // TSFT
+    field(1, 1, 1); // Flags
+    if (const auto at = field(2, 1, 1)) {
+        out.rate_500kbps = packet[*at];
+    }
+    if (const auto at = field(3, 2, 4)) {
+        out.channel_mhz = ReadU16(packet.data() + *at);
+    }
+    field(4, 2, 2); // FHSS
+    if (const auto at = field(5, 1, 1)) {
+        out.signal_dbm = static_cast<s8>(packet[*at]);
+    }
+    field(6, 1, 1);  // dBm antenna noise
+    field(7, 2, 2);  // Lock quality
+    field(8, 2, 2);  // TX attenuation
+    field(9, 2, 2);  // dB TX attenuation
+    field(10, 1, 1); // dBm TX power
+    field(11, 1, 1); // Antenna
+    field(12, 1, 1); // dB antenna signal
+    field(13, 1, 1); // dB antenna noise
+    field(14, 2, 2); // RX flags
+    field(15, 2, 2); // TX flags
+    field(16, 1, 1); // RTS retries
+    field(17, 1, 1); // Data retries
+    field(18, 4, 8); // XChannel
+    if (const auto at = field(19, 1, 3)) {
+        out.mcs = std::array<u8, 3>{packet[*at], packet[*at + 1], packet[*at + 2]};
+    }
+    return out;
+}
+
+// Temporary experiment: transmit rate for frames a client originates, read from
+// tx_rate_mbps=<n> in uds_client_experiment.txt (user directory). The file is re-read at most
+// every two seconds, so it can be changed between attempts without restarting.
+std::optional<u8> ExperimentTxRate500kbps() {
+    static std::mutex mutex;
+    static auto next_read = std::chrono::steady_clock::time_point{};
+    static std::optional<u8> cached;
+    std::scoped_lock lock{mutex};
+    const auto now = std::chrono::steady_clock::now();
+    if (now < next_read) {
+        return cached;
+    }
+    next_read = now + std::chrono::seconds(2);
+
+    std::optional<u8> value;
+    std::ifstream file(FileUtil::GetUserPath(FileUtil::UserPath::UserDir) +
+                       "uds_client_experiment.txt");
+    std::string line;
+    while (std::getline(file, line)) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) {
+            line.pop_back();
+        }
+        constexpr std::string_view Key = "tx_rate_mbps=";
+        if (line.rfind(Key, 0) != 0) {
+            continue;
+        }
+        try {
+            const double mbps = std::stod(line.substr(Key.size()));
+            const long half_mbps = std::lround(mbps * 2.0);
+            if (half_mbps >= 1 && half_mbps <= 127) {
+                value = static_cast<u8>(half_mbps);
+            }
+        } catch (...) {
+        }
+    }
+    if (value != cached) {
+        LOG_INFO(Service_NWM, "UDS Real: client data TX rate override is now {}",
+                 value ? fmt::format("{} Mbps", *value / 2.0) : std::string{"driver default"});
+    }
+    cached = value;
+    return cached;
+}
+
 std::optional<RadiotapInfo> ParseRadiotap(const std::vector<u8>& packet) {
     if (packet.size() < 8 || packet[0] != 0 || packet[1] != 0) {
         return std::nullopt;
@@ -1183,19 +1315,48 @@ bool IsGroupAddressedFrame(std::span<const u8> frame) {
 }
 
 std::vector<u8> AddRadiotapHeader(std::span<const u8> frame, bool no_ack) {
+    constexpr u32 RadiotapPresentRate = 1U << 2;
     constexpr u32 RadiotapPresentTxFlags = 1U << 15;
     constexpr u16 RadiotapTxNoAck = 0x0008;
 
+    // Optional experiment: fixed rate for data frames a client originates (NoDS/ToDS). Frames a
+    // host sends (FromDS) and all management frames keep the driver's default rate.
+    std::optional<u8> rate;
+    if (frame.size() >= 2) {
+        const u16 frame_control = ReadU16(frame.data());
+        const bool is_data = ((frame_control >> 2) & 0x3) == 2;
+        const bool from_ds = (frame_control & 0x0200) != 0;
+        if (is_data && !from_ds) {
+            rate = ExperimentTxRate500kbps();
+        }
+    }
+
+    u32 present = 0;
+    u16 radiotap_length = 8;
+    if (rate) {
+        present |= RadiotapPresentRate;
+        radiotap_length = 9;
+    }
+    if (no_ack) {
+        present |= RadiotapPresentTxFlags;
+        radiotap_length = rate ? 12 : 10; // TX flags are 2-byte aligned: pad after the rate.
+    }
+
     std::vector<u8> packet;
-    const u16 radiotap_length = no_ack ? 10 : 8;
     packet.reserve(radiotap_length + frame.size());
     packet.push_back(0);
     packet.push_back(0);
     AppendU16(packet, radiotap_length);
-    AppendU32(packet, no_ack ? RadiotapPresentTxFlags : 0);
+    AppendU32(packet, present);
+    if (rate) {
+        packet.push_back(*rate);
+    }
     if (no_ack) {
-        // TX_FLAGS is naturally aligned at offset eight. Broadcast/group frames cannot be ACKed;
-        // explicitly saying so prevents mac80211/rtw88 from waiting for an impossible TX report.
+        if (rate) {
+            packet.push_back(0); // Alignment padding before TX flags.
+        }
+        // Broadcast/group frames cannot be ACKed; explicitly saying so prevents mac80211/rtw88
+        // from waiting for an impossible TX report.
         AppendU16(packet, RadiotapTxNoAck);
     }
     packet.insert(packet.end(), frame.begin(), frame.end());
@@ -1391,6 +1552,7 @@ void RunMonitorBody(std::atomic<bool>& stop_requested,
         u16 transmitted_probe_sequence = 0;
         u16 transmitted_beacon_sequence = 0;
         std::optional<PhysicalBeaconSnapshot> latest_physical_beacon;
+        std::optional<PhysicalBeaconSnapshot> ack_shell_beacon;
         AccessPointConfiguration access_point_config{};
         u64 applied_access_point_generation = 0;
         bool access_point_prepared = false;
@@ -1537,7 +1699,18 @@ void RunMonitorBody(std::atomic<bool>& stop_requested,
                     !access_point_config.enabled) {
                     return;
                 }
-                if (!latest_physical_beacon) {
+                // The client-role shell is requested and started in the same worker pass, before
+                // the periodic beacon poll below has loaded its beacon, so fetch it directly.
+                if (!latest_physical_beacon && !ack_shell_beacon) {
+                    if (auto pending = physical_beacon_provider();
+                        pending && pending->ack_shell_only) {
+                        ack_shell_beacon = std::move(*pending);
+                    }
+                }
+                // A hosted network's beacon wins; the client-role shell has only its own minimal one.
+                const std::optional<PhysicalBeaconSnapshot>& shell_beacon =
+                    latest_physical_beacon ? latest_physical_beacon : ack_shell_beacon;
+                if (!shell_beacon) {
                     LOG_WARNING(Service_NWM,
                                 "UDS Real ACK shell: activation deferred until the first host "
                                 "beacon is available");
@@ -1547,11 +1720,10 @@ void RunMonitorBody(std::atomic<bool>& stop_requested,
                 SetChannel(connection, generic_socket_id, port_id, family_id,
                            access_point_ifindex, ChannelToFrequency(current_channel), sequence);
                 StartAccessPoint(connection, generic_socket_id, port_id, family_id,
-                                 access_point_ifindex, access_point_config,
-                                 *latest_physical_beacon,
+                                 access_point_ifindex, access_point_config, *shell_beacon,
                                  static_cast<u8>(current_channel), sequence);
                 access_point_started = true;
-                applied_access_point_beacon_body = latest_physical_beacon->body;
+                applied_access_point_beacon_body = shell_beacon->body;
                 LOG_INFO(Service_NWM,
                          "UDS Real ACK shell: START_AP accepted, interface={}, ifindex={}, "
                          "channel={}, hardware MAC acknowledgements requested; kernelKeys=false, "
@@ -1672,7 +1844,8 @@ void RunMonitorBody(std::atomic<bool>& stop_requested,
                     const u16 radiotap_tx_flags =
                         radiotap_length >= 10 ? ReadU16(physical_frame.data() + 8) : 0;
                     const bool radiotap_length_valid =
-                        radiotap_length == (radiotap_no_ack ? 10 : 8);
+                        radiotap_length == (radiotap_no_ack ? 10 : 8) ||
+                        radiotap_length == (radiotap_no_ack ? 12 : 9);
                     const bool packet_length_valid =
                         physical_frame.size() == radiotap_length + pending_frame->size();
                     const bool ccmp_header_valid = ccmp_header[2] == 0 &&
@@ -1787,6 +1960,29 @@ void RunMonitorBody(std::atomic<bool>& stop_requested,
                 }
                 auto beacon = ParseNintendoBeacon(packet, static_cast<u8>(current_channel));
                 if (beacon) {
+                    // Temporary diagnostic: dump every distinct beacon body (ignoring the 8-byte
+                    // timestamp) once, for retail beacons and for the beacons we transmit, so the
+                    // information elements can be compared offline.
+                    if (beacon->frame.size() > 8) {
+                        u64 body_hash = 1469598103934665603ULL;
+                        for (std::size_t i = 8; i < beacon->frame.size(); ++i) {
+                            body_hash = (body_hash ^ beacon->frame[i]) * 1099511628211ULL;
+                        }
+                        const bool ours = latest_physical_beacon &&
+                                          beacon->transmitter_address ==
+                                              latest_physical_beacon->host_address;
+                        static std::array<std::set<u64>, 2> dumped_bodies;
+                        auto& dumped = dumped_bodies[ours ? 1 : 0];
+                        if (dumped.size() < 400 && dumped.insert(body_hash).second) {
+                            LOG_INFO(Service_NWM,
+                                     "UDS BEACON DUMP {} #{}: source={}, channel={}, bytes={}, "
+                                     "hash=0x{:016X}, body={}",
+                                     ours ? "ours" : "retail", dumped.size(),
+                                     FormatMac(beacon->transmitter_address.data()),
+                                     beacon->channel, beacon->frame.size(), body_hash,
+                                     FormatHexBytes(beacon->frame));
+                        }
+                    }
                     const bool is_transmitted_beacon_echo =
                         latest_physical_beacon &&
                         beacon->transmitter_address == latest_physical_beacon->host_address;
@@ -1831,6 +2027,104 @@ void RunMonitorBody(std::atomic<bool>& stop_requested,
                 // latest_physical_beacon: that object exists only while Azahar hosts. When
                 // Azahar joins a retail-hosted network there is no local beacon, and the old gate
                 // consequently discarded every authentication response before nwm::UDS saw it.
+                // Temporary diagnostic: signal strength and rate of the retail host's frames and of
+                // our own transmissions as captured back by the monitor (which shows the rate the
+                // radio really used). Rate-limited to the first frames of each kind, then 1 in 200.
+                // Link-layer ACKs addressed to us show whether the retail host actually receives our
+                // unicast frames (a data frame with no following ACK was lost or not decoded).
+                if (const auto ack_radiotap = ParseRadiotap(packet);
+                    ack_radiotap && packet.size() >= ack_radiotap->length + 10) {
+                    const u16 ack_frame_control = ReadU16(packet.data() + ack_radiotap->length);
+                    if (((ack_frame_control >> 2) & 0x3) == 1 &&
+                        ((ack_frame_control >> 4) & 0xF) == 13 &&
+                        std::memcmp(packet.data() + ack_radiotap->length + 4, local_address.data(),
+                                    6) == 0) {
+                        static std::size_t ack_count = 0;
+                        ++ack_count;
+                        if (ack_count <= 400 || ack_count % 200 == 0) {
+                            const auto radio = DescribeRadiotapSignal(packet);
+                            LOG_INFO(Service_NWM, "UDS Real RADIO ACK-RX #{}: rate={}, signalDbm={}",
+                                     ack_count,
+                                     radio.rate_500kbps
+                                         ? fmt::format("{} Mbps", *radio.rate_500kbps / 2.0)
+                                         : std::string{"n/a"},
+                                     radio.signal_dbm ? std::to_string(*radio.signal_dbm)
+                                                      : std::string{"n/a"});
+                        }
+                    }
+                }
+                if (const auto radiotap = ParseRadiotap(packet);
+                    radiotap && packet.size() >= radiotap->length + 16) {
+                    const u16 radio_frame_control = ReadU16(packet.data() + radiotap->length);
+                    if (((radio_frame_control >> 2) & 0x3) != 1) { // Control frames have no A2.
+                        std::array<u8, 6> radio_transmitter{};
+                        std::memcpy(radio_transmitter.data(),
+                                    packet.data() + radiotap->length + 10, 6);
+                        const bool radio_local = radio_transmitter == local_address;
+                        const bool radio_retail =
+                            have_nintendo_source && radio_transmitter == nintendo_source;
+                        if (radio_retail) {
+                            // Capture completeness: the retail host numbers every frame it sends
+                            // (beacons and data) consecutively, so a gap in what we captured is a
+                            // frame the monitor missed. Duplicates (retries) repeat a number.
+                            static int last_seq = -1;
+                            static std::size_t seen = 0;
+                            static std::size_t missed = 0;
+                            static auto window_start = std::chrono::steady_clock::now();
+                            const int seq = ReadU16(packet.data() + radiotap->length + 22) >> 4;
+                            if (last_seq >= 0) {
+                                const int gap = (seq - last_seq) & 0xFFF;
+                                if (gap > 1 && gap < 64) {
+                                    missed += static_cast<std::size_t>(gap - 1);
+                                }
+                            }
+                            last_seq = seq;
+                            ++seen;
+                            const auto now = std::chrono::steady_clock::now();
+                            if (now - window_start >= std::chrono::seconds(3)) {
+                                LOG_INFO(Service_NWM,
+                                         "UDS Real RADIO retail-capture: last 3s captured={}, "
+                                         "missedByGap={}",
+                                         seen, missed);
+                                seen = 0;
+                                missed = 0;
+                                window_start = now;
+                            }
+                        }
+                        if (radio_local || radio_retail) {
+                            // Data frames get their own counters: beacons and probes would otherwise
+                            // use up the budget before any data frame is seen.
+                            const bool radio_data = ((radio_frame_control >> 2) & 0x3) == 2;
+                            static std::array<std::size_t, 4> radio_counts{};
+                            const std::size_t count =
+                                ++radio_counts[(radio_local ? 0 : 1) + (radio_data ? 2 : 0)];
+                            if (count <= (radio_data ? 300U : 20U) || count % 200 == 0) {
+                                const auto radio = DescribeRadiotapSignal(packet);
+                                LOG_INFO(Service_NWM,
+                                         "UDS Real RADIO {} #{}: type={}, subtype={}, "
+                                         "rate={}, signalDbm={}, channelMhz={}, mcs={}, "
+                                         "frameBytes={}, retry={}, dot11Seq={}",
+                                         radio_local ? "our-TX-echo" : "retail-RX", count,
+                                         (radio_frame_control >> 2) & 0x3,
+                                         (radio_frame_control >> 4) & 0xF,
+                                         radio.rate_500kbps
+                                             ? fmt::format("{} Mbps", *radio.rate_500kbps / 2.0)
+                                             : std::string{"n/a"},
+                                         radio.signal_dbm ? std::to_string(*radio.signal_dbm)
+                                                          : std::string{"n/a"},
+                                         radio.channel_mhz ? std::to_string(*radio.channel_mhz)
+                                                           : std::string{"n/a"},
+                                         radio.mcs ? fmt::format("{:02X}:{:02X}:{:02X}",
+                                                                 (*radio.mcs)[0], (*radio.mcs)[1],
+                                                                 (*radio.mcs)[2])
+                                                   : std::string{"n/a"},
+                                         packet.size() - radiotap->length,
+                                         (radio_frame_control & 0x0800) != 0,
+                                         ReadU16(packet.data() + radiotap->length + 22) >> 4);
+                            }
+                        }
+                    }
+                }
                 {
                     auto frame = ParseCapturedFrame(packet, static_cast<u8>(current_channel));
                     const bool from_local =
@@ -1964,7 +2258,19 @@ void RunMonitorBody(std::atomic<bool>& stop_requested,
 
             const auto now = std::chrono::steady_clock::now();
             if (now >= next_physical_beacon) {
-                if (auto pending_beacon = physical_beacon_provider(); pending_beacon) {
+                auto pending_beacon = physical_beacon_provider();
+                if (pending_beacon && pending_beacon->ack_shell_only) {
+                    // Client-role ACK shell: keep it only for the AP start, never transmit it.
+                    ack_shell_beacon = std::move(*pending_beacon);
+                    pending_beacon.reset();
+                    latest_physical_beacon.reset();
+                } else if (!pending_beacon) {
+                    // Nothing is hosted any more. The monitor now outlives UDS sessions, so drop
+                    // the previous session's beacons instead of continuing to use them.
+                    latest_physical_beacon.reset();
+                    ack_shell_beacon.reset();
+                }
+                if (pending_beacon) {
                     if (active_monitor_enabled && !active_monitor_mac &&
                         !active_monitor_mac_failed) {
                         try {
@@ -2444,6 +2750,9 @@ void Nl80211Monitor::ResetAccessPoint() {
     impl->access_point_activation_requested = false;
     impl->pending_access_point_stations.clear();
     impl->pending_access_point_data.clear();
+    // The monitor now outlives UDS sessions, so the finished session's beacon must not linger.
+    impl->have_pending_beacon = false;
+    impl->pending_beacon = {};
 }
 
 void Nl80211Monitor::SubmitBeacon(std::span<const u8> beacon_body,
@@ -2455,7 +2764,59 @@ void Nl80211Monitor::SubmitBeacon(std::span<const u8> beacon_body,
     std::scoped_lock lock{impl->mutex};
     impl->pending_beacon.body.assign(beacon_body.begin(), beacon_body.end());
     impl->pending_beacon.host_address = host_address;
+    impl->pending_beacon.ack_shell_only = false;
     impl->have_pending_beacon = true;
+}
+
+void Nl80211Monitor::ConfigureClientAckShell(const std::array<u8, 6>& own_address,
+                                             const std::array<u8, 6>& host_address,
+                                             u32 network_id,
+                                             std::span<const u8> association_body) {
+    std::scoped_lock lock{impl->mutex};
+
+    // Same companion interface as the host role, but adopting our own address.
+    impl->access_point_config.host_address = own_address;
+    constexpr std::array<char, 16> HexDigits = {'0', '1', '2', '3', '4', '5', '6', '7',
+                                                '8', '9', 'A', 'B', 'C', 'D', 'E', 'F'};
+    for (std::size_t index = 0; index < impl->access_point_config.ssid.size(); ++index) {
+        const std::size_t shift = (impl->access_point_config.ssid.size() - index - 1) * 4;
+        impl->access_point_config.ssid[index] =
+            static_cast<u8>(HexDigits[(network_id >> shift) & 0xF]);
+    }
+    impl->access_point_config.max_stations = 1;
+    impl->access_point_config.enabled = true;
+    ++impl->access_point_config.generation;
+
+    // Minimal hidden-network beacon: fixed parameters, the (hidden) SSID and basic rates. It has
+    // no Nintendo vendor elements, so no console can mistake it for a UDS network. The DS
+    // parameter set is added for the current channel when the AP starts.
+    std::vector<u8> body(8, 0); // Timestamp.
+    body.push_back(100);        // Beacon interval: 100 TU.
+    body.push_back(0);
+    body.push_back(0x31); // Capability: ESS, privacy, short preamble, short slot time.
+    body.push_back(0x04);
+    body.push_back(0); // SSID.
+    body.push_back(static_cast<u8>(impl->access_point_config.ssid.size()));
+    body.insert(body.end(), impl->access_point_config.ssid.begin(),
+                impl->access_point_config.ssid.end());
+    constexpr std::array<u8, 8> SupportedRates{0x82, 0x84, 0x8B, 0x96, 0x0C, 0x12, 0x18, 0x24};
+    body.push_back(1);
+    body.push_back(static_cast<u8>(SupportedRates.size()));
+    body.insert(body.end(), SupportedRates.begin(), SupportedRates.end());
+
+    impl->pending_beacon.body = std::move(body);
+    impl->pending_beacon.host_address = own_address;
+    impl->pending_beacon.ack_shell_only = true;
+    impl->have_pending_beacon = true;
+
+    // Bring the shell up now and register the retail host so it is acknowledged from its first
+    // frame. The worker starts the AP and registers the station before it transmits anything
+    // queued afterwards, including our authentication request.
+    impl->access_point_activation_requested = true;
+    AccessPointStationRequest request;
+    request.station_address = host_address;
+    request.association_body.assign(association_body.begin(), association_body.end());
+    impl->pending_access_point_stations.push_back(std::move(request));
 }
 
 void Nl80211Monitor::Stop() {
