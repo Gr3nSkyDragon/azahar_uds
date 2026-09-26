@@ -7,6 +7,10 @@
 #include <memory>
 #include <QWidget>
 
+namespace Service::NWM::UdsReal::Esp32 {
+struct DeviceStatus;
+}
+
 namespace Ui {
 class ConfigureWeb;
 }
@@ -23,5 +27,10 @@ public:
     void SetConfiguration();
 
 private:
+    void RefreshEsp32Status();
+    void ConnectEsp32();
+    void ShowEsp32Status(const Service::NWM::UdsReal::Esp32::DeviceStatus& status);
+
     std::unique_ptr<Ui::ConfigureWeb> ui;
+    bool esp32_probe_running = false;
 };

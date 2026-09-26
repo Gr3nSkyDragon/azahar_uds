@@ -595,7 +595,12 @@ static const char* android_config_default_file_content = (BOOST_HANA_STRING(R"(
 # URL for Web API
 )") DECLARE_KEY(web_api_url) BOOST_HANA_STRING(R"(
 # Token for Web Service
-)") DECLARE_KEY(network_token) BOOST_HANA_STRING("\n")
+)") DECLARE_KEY(network_token) BOOST_HANA_STRING(R"(
+
+# Whether to carry local wireless (UDS) traffic over a real radio: an ESP32-S3 running the
+# esp32-uds-bridge firmware, attached by USB. Lets the emulator trade with a retail 3DS.
+# 0 (default): Off, 1: On
+)") DECLARE_KEY(use_esp32_uds) BOOST_HANA_STRING("\n")
 
 ).c_str();
 

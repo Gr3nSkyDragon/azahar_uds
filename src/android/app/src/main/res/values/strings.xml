@@ -370,6 +370,8 @@
     <!-- Debug settings strings -->
     <string name="cpu_jit">CPU JIT</string>
     <string name="cpu_jit_description">Uses the Just-in-Time (JIT) compiler for CPU emulation. When enabled, game performance will be significantly improved.</string>
+    <string name="use_esp32_uds">ESP32 local wireless</string>
+    <string name="use_esp32_uds_description">Carry local wireless (UDS) traffic over an ESP32-S3 attached by USB, so the emulator can trade with a retail 3DS. Requires the esp32-uds-bridge firmware. Takes effect the next time a game starts local wireless.</string>
     <string name="use_fastinterp">Use Fast Interpreter</string>
     <string name="use_fastinterp_description">When the CPU JIT is disabled, use the fast interpreter instead of the legacy interpreter. Restart required.</string>
     <string name="hw_shaders">Enable Hardware Shader</string>

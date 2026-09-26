@@ -22,6 +22,9 @@ Configuration doesn't matter. The emulator can request the 3DS and vice versa. Y
 In order to trade, start ldnd.exe before launching any emulator titles. Once ldnd.exe says it's ready, start your selected game in both the emulator and retail console. Navigate through the Local Wireless Trade menus to begin and complete the trade. Gen 6 uses the PSS, and Gen 7 uses the Festival Plaza.
 This mod is only designed to do local wireless trading. It isn't intended for trading over the internet. Any multiplayer features beyond trading may or may not work. I haven't tested anything other than trading at this point as that was my primary interest.
 
+### Android (experimental, `android-esp32` branch)
+On Android the radio is an **ESP32-S3 connected to the phone by USB-C** instead of a USB Wi-Fi adapter and ldnd.exe. Flash the board with [firmware/esp32-uds-bridge](firmware/esp32-uds-bridge/README.md), plug it into the phone's USB-C port, then turn on **Settings > Network > ESP32 local wireless** and start the game. Android asks for USB permission for the board the first time. This path has not been tested on hardware yet; see the firmware README for what is and isn't verified.
+
 ---
 
 ![Azahar Emulator](https://azahar-emu.org/resources/images/logo/azahar-name-and-logo.svg)

@@ -57,6 +57,49 @@
     </widget>
    </item>
    <item>
+    <widget class="QGroupBox" name="esp32_group">
+     <property name="title">
+      <string>ESP32</string>
+     </property>
+     <layout class="QVBoxLayout" name="verticalLayout_esp32">
+      <item>
+       <widget class="QCheckBox" name="toggle_esp32">
+        <property name="toolTip">
+         <string>Carry local wireless (UDS) traffic through an ESP32-S3 running the esp32-uds-bridge firmware, instead of ldnd.exe and a USB Wi-Fi adapter. Takes effect the next time a game starts local wireless.</string>
+        </property>
+        <property name="text">
+         <string>Use an ESP32 for local wireless</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <layout class="QHBoxLayout" name="horizontalLayout_esp32">
+        <item>
+         <widget class="QPushButton" name="esp32_connect_button">
+          <property name="toolTip">
+           <string>Check that the ESP32 is connected and running the right firmware.</string>
+          </property>
+          <property name="text">
+           <string>Connect</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QLabel" name="esp32_status_label">
+          <property name="text">
+           <string/>
+          </property>
+          <property name="wordWrap">
+           <bool>true</bool>
+          </property>
+         </widget>
+        </item>
+       </layout>
+      </item>
+     </layout>
+    </widget>
+   </item>
+   <item>
     <spacer name="verticalSpacer">
      <property name="orientation">
       <enum>Qt::Vertical</enum>
