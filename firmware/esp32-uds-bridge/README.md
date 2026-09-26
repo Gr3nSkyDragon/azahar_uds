@@ -24,6 +24,31 @@ Any ESP32-S3 board. **Use the chip's native USB port** (the one wired to GPIO19/
 what the app looks for. Connect it to the phone with a USB-C cable (a USB-C to USB-C cable, or an OTG
 adapter). The board is powered from the phone; 2.4 GHz radio TX draws a few hundred mA.
 
+## Flashing a pre-built firmware (no ESP-IDF needed)
+
+Each release ships one file, `esp32-uds-bridge-fw<version>-esp32s3.bin` (bootloader, partition table
+and app merged). It is written at **offset `0x0`**. Plug the board in through its **native USB port**
+(the one that shows up as an Espressif USB Serial/JTAG device) and use either of these:
+
+**In the browser (nothing to install).** Open Espressif's [esptool-js](https://espressif.github.io/esptool-js/)
+in Chrome or Edge (it needs Web Serial). Connect, pick the board's port, add the `.bin` at address
+`0x0`, and Program.
+
+**With esptool.**
+
+```
+pip install esptool
+esptool --chip esp32s3 -p COM4 write_flash 0x0 esp32-uds-bridge-fw1.3-esp32s3.bin
+```
+
+(replace `COM4` with the board's port; on older esptool versions the command is `esptool.py`).
+
+If the board is not detected, hold **BOOT** while plugging it in, then release it. The firmware prints
+nothing after flashing; in Azahar's Network settings, **Connect** should report the firmware version.
+The merged file was verified by flashing it to a real ESP32-S3 with esptool and with esptool-js.
+
+To produce the merged file for a new release, run `package-release-bin.ps1` from an ESP-IDF PowerShell.
+
 ## Build and flash
 
 Requires ESP-IDF 5.2 or newer (`idf.py`).
