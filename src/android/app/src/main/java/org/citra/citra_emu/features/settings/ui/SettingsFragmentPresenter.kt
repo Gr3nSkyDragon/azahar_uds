@@ -1808,6 +1808,15 @@ class SettingsFragmentPresenter(private val fragmentView: SettingsFragmentView) 
                     StringSetting.NETWORK_TOKEN.defaultValue
                 )
             )
+            add(
+                SwitchSetting(
+                    BooleanSetting.USE_ESP32_UDS,
+                    R.string.use_esp32_uds,
+                    R.string.use_esp32_uds_description,
+                    BooleanSetting.USE_ESP32_UDS.key,
+                    BooleanSetting.USE_ESP32_UDS.defaultValue
+                )
+            )
         }
     }
 

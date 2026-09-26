@@ -19,6 +19,7 @@ add_library(citra-android SHARED
     default_ini.h
     emu_window/emu_window.cpp
     emu_window/emu_window.h
+    esp32_usb_serial.cpp
     game_info.cpp
     id_cache.cpp
     id_cache.h

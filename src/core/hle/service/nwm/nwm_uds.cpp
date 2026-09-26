@@ -32,6 +32,7 @@
 #include "core/hle/service/nwm/uds_connection.h"
 #include "core/hle/service/nwm/uds_data.h"
 #include "core/hle/service/nwm/uds_real/nl80211_monitor.h"
+#include "core/hle/service/nwm/uds_real/uds_real_config.h"
 #include "core/memory.h"
 
 SERIALIZE_EXPORT_IMPL(Service::NWM::NWM_UDS)
@@ -228,7 +229,7 @@ void NWM_UDS::SendPacket(Network::WifiPacket& packet) {
         }
     }
 
-#ifdef _WIN32
+#if UDS_REAL_BACKEND
     SendPhysicalPacket(packet);
 #endif
 }
@@ -831,7 +832,7 @@ void NWM_UDS::HandleAuthenticationFrame(const Network::WifiPacket& packet) {
     // association request after the host authenticates it. The exact request body below was
     // captured from a retail 3DS joining an Azahar-hosted Pokemon X network.
     if (sequence == AuthenticationSeq::SEQ2) {
-#ifdef _WIN32
+#if UDS_REAL_BACKEND
         bool send_association_request = false;
         {
             std::scoped_lock lock(connection_status_mutex);
@@ -973,7 +974,7 @@ void NWM_UDS::OnWifiPacketReceived(const Network::WifiPacket& packet) {
 }
 
 void NWM_UDS::SendPhysicalPacket(const Network::WifiPacket& packet) {
-#ifdef _WIN32
+#if UDS_REAL_BACKEND
     if (!real_monitor || !real_monitor->IsRunning()) {
         return;
     }
@@ -1151,7 +1152,7 @@ static std::vector<u8> GenerateAssociationRequestBody(u32 network_id) {
 }
 
 void NWM_UDS::SendPhysicalAssociationRequest(const MacAddress& host_address) {
-#ifdef _WIN32
+#if UDS_REAL_BACKEND
     if (!real_monitor || !real_monitor->IsRunning()) {
         return;
     }
@@ -1194,7 +1195,7 @@ void NWM_UDS::SendPhysicalAssociationRequest(const MacAddress& host_address) {
 }
 
 void NWM_UDS::OnPhysicalFrameReceived(UdsReal::CapturedFrame frame) {
-#ifdef _WIN32
+#if UDS_REAL_BACKEND
     ++physical_rx_frame_count;
 
     Network::WifiPacket packet{};
@@ -1437,7 +1438,7 @@ boost::optional<Network::MacAddress> NWM_UDS::GetNodeMacAddress(u16 dest_node_id
 }
 
 void NWM_UDS::MonitorLingerCallback(std::uintptr_t user_data, [[maybe_unused]] s64 cycles_late) {
-#ifdef _WIN32
+#if UDS_REAL_BACKEND
     if (user_data != monitor_linger_generation || initialized) {
         return; // UDS was initialized again since this stop was scheduled.
     }
@@ -1450,7 +1451,7 @@ void NWM_UDS::MonitorLingerCallback(std::uintptr_t user_data, [[maybe_unused]] s
 }
 
 void NWM_UDS::ShutdownHLE() {
-#ifdef _WIN32
+#if UDS_REAL_BACKEND
     if (real_monitor && real_monitor->IsRunning()) {
         // Keep the monitor up for a while; see monitor_linger_event.
         ++monitor_linger_generation;
@@ -1643,11 +1644,14 @@ ResultVal<std::shared_ptr<Kernel::Event>> NWM_UDS::Initialize(
         channel_data.clear();
     }
 
-#ifdef _WIN32
-    if (!real_monitor) {
+#if UDS_REAL_BACKEND
+    if (!real_monitor && UdsReal::IsPhysicalBackendEnabled()) {
         real_monitor = std::make_unique<UdsReal::Nl80211Monitor>();
     }
     ++monitor_linger_generation; // Cancel any pending idle stop; we're using the monitor again.
+    if (!real_monitor) {
+        return connection_status_event;
+    }
     if (real_monitor->IsRunning()) {
         LOG_INFO(Service_NWM, "UDS Real: reusing the running physical monitor");
     }
@@ -2017,7 +2021,7 @@ Result NWM_UDS::BeginHostingNetwork(std::span<const u8> network_info_buffer,
              network_info.id, static_cast<u32>(network_info.network_id), network_channel,
              network_info.max_nodes, application_data_size, application_fingerprint);
 
-#ifdef _WIN32
+#if UDS_REAL_BACKEND
     if (real_monitor && physical_data_ccmp_key) {
         const u8 maximum_clients = network_info.max_nodes > 1 ? network_info.max_nodes - 1 : 1;
         real_monitor->ConfigureAccessPoint(network_info.host_mac_address,
@@ -2182,7 +2186,7 @@ Result NWM_UDS::DestroyNetworkHLE() {
     node_map.clear();
     physical_management_reply_sequences.clear();
     last_eapol_frame_data.clear();
-#ifdef _WIN32
+#if UDS_REAL_BACKEND
     if (real_monitor) {
         real_monitor->ResetAccessPoint();
     }
@@ -2502,7 +2506,7 @@ void NWM_UDS::ConnectToNetworkHLE(NetworkInfo net_info, u8 connection_type,
     // than spending most of the IPC timeout rediscovering that same host.
     if (network_info.channel >= 1 && network_info.channel <= 13) {
         network_channel = network_info.channel;
-#ifdef _WIN32
+#if UDS_REAL_BACKEND
         if (real_monitor) {
             real_monitor->SelectPeerChannel(network_channel);
         }
@@ -2520,7 +2524,7 @@ void NWM_UDS::ConnectToNetworkHLE(NetworkInfo net_info, u8 connection_type,
     physical_rx_frame_count = 0;
     physical_rx_ccmp_failure_count = 0;
 
-#ifdef _WIN32
+#if UDS_REAL_BACKEND
     if (real_monitor) {
         // The retail host's unicast frames to us need immediate hardware ACKs, which a passive
         // monitor cannot send. Bring up the ACK shell with our own address before anything is
@@ -2609,7 +2613,7 @@ ResultStatus NWM_UDS::DisconnectNetworkHLE() {
         physical_management_reply_sequences.clear();
         last_eapol_frame_data.clear();
         SignalEventAsync(connection_status_event);
-#ifdef _WIN32
+#if UDS_REAL_BACKEND
         if (real_monitor) {
             real_monitor->ResetAccessPoint(); // Tear down the client ACK shell.
         }
@@ -2879,7 +2883,7 @@ void NWM_UDS::BeaconBroadcastCallback(std::uintptr_t user_data, s64 cycles_late)
     std::vector<u8> frame = GenerateBeaconFrame(network_info, node_info);
 
     bool physical_beacon_queued = false;
-#ifdef _WIN32
+#if UDS_REAL_BACKEND
     if (real_monitor && real_monitor->IsRunning()) {
         real_monitor->SubmitBeacon(std::span<const u8>{frame.data(), frame.size()},
                                    network_info.host_mac_address);
@@ -3029,7 +3033,7 @@ NWM_UDS::NWM_UDS(Core::System& system) : ServiceFramework("nwm::UDS"), system(sy
 }
 
 NWM_UDS::~NWM_UDS() {
-#ifdef _WIN32
+#if UDS_REAL_BACKEND
     if (real_monitor) {
         real_monitor->Stop();
     }

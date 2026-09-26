@@ -52,6 +52,7 @@ import org.citra.citra_emu.utils.ControllerMappingHelper
 import org.citra.citra_emu.utils.DirectoryInitialization
 import org.citra.citra_emu.utils.EmulationLifecycleUtil
 import org.citra.citra_emu.utils.EmulationMenuSettings
+import org.citra.citra_emu.utils.Esp32UsbLink
 import org.citra.citra_emu.utils.FileBrowserHelper
 import org.citra.citra_emu.utils.Log
 import org.citra.citra_emu.utils.NetPlayManager
@@ -131,6 +132,13 @@ class EmulationActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
 
         NativeLibrary.initMultiplayer()
+
+        // Local wireless through an ESP32-S3 (Network settings). Registering the link is cheap and
+        // lets the core find the board; the USB permission prompt only appears if it is enabled.
+        Esp32UsbLink.install()
+        if (BooleanSetting.USE_ESP32_UDS.boolean) {
+            Esp32UsbLink.ensurePermission(this)
+        }
 
         secondaryDisplayManager = SecondaryDisplay(this)
         secondaryDisplayManager.updateDisplay()

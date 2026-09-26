@@ -332,6 +332,7 @@ void Config::ReadValues() {
     // Web Service
     ReadSetting("WebService", Settings::values.web_api_url);
     ReadSetting("WebService", Settings::values.network_token);
+    ReadSetting("WebService", Settings::values.use_esp32_uds);
 }
 
 void Config::Reload() {

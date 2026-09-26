@@ -5,6 +5,7 @@ add_executable(tests
     core/core_timing.cpp
     core/file_sys/path_parser.cpp
     core/hle/kernel/hle_ipc.cpp
+    core/hle/service/nwm/esp32_wire.cpp
     core/memory/memory.cpp
     core/memory/vm_manager.cpp
     precompiled_headers.h

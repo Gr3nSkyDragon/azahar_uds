@@ -23,6 +23,9 @@
 
 #include "common/common_types.h"
 #include "common/logging/log.h"
+#include "common/settings.h"
+#include "core/hle/service/nwm/uds_real/esp32_serial.h"
+#include "core/hle/service/nwm/uds_real/esp32_wire.h"
 #include "core/hle/service/nwm/uds_real/ldnd_connection.h"
 
 namespace Service::NWM::UdsReal {
@@ -1323,7 +1326,7 @@ std::vector<u8> AddRadiotapHeader(std::span<const u8> frame, bool no_ack) {
     return packet;
 }
 
-void RunMonitorBody(std::atomic<bool>& stop_requested,
+[[maybe_unused]] void RunMonitorBody(std::atomic<bool>& stop_requested,
                     std::atomic<u16>& selected_peer_channel, u16 requested_channel,
                     const std::array<u8, 6>& local_address,
                     const Nl80211Monitor::BeaconCallback& beacon_callback,
@@ -2500,6 +2503,529 @@ void RunMonitorBody(std::atomic<bool>& stop_requested,
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// ESP32 radio backend (Android). Same job as RunMonitorBody, but the radio is an ESP32-S3 running
+// firmware/esp32-uds-bridge, reached over a USB serial port. The device does raw capture/inject,
+// periodic beacon transmission and hardware ACKs for the MAC it was started with; discovery,
+// channel policy and everything above the MPDU stay here so both backends behave alike.
+// ---------------------------------------------------------------------------------------------
+
+constexpr std::array<u8, 8> RadiotapEmpty{0, 0, 8, 0, 0, 0, 0, 0};
+
+// The shared generators emit a minimal 8-byte radiotap header for monitor injection; the ESP32
+// takes the bare MPDU.
+std::vector<u8> StripRadiotap(std::vector<u8> packet) {
+    if (packet.size() >= RadiotapEmpty.size()) {
+        packet.erase(packet.begin(), packet.begin() + RadiotapEmpty.size());
+    }
+    return packet;
+}
+
+class Esp32Session {
+public:
+    explicit Esp32Session(std::atomic<bool>& stop) : stop_requested{stop} {}
+
+    // Opens the port and completes the HELLO handshake. Returns false if the board is not there.
+    bool Connect() {
+        port = Esp32::OpenSerialPort();
+        if (!port) {
+            return false;
+        }
+        decoder = Esp32::Decoder{};
+        hello_ack.reset();
+        received.clear();
+        // Opening the native USB port can reset the chip; keep asking until it answers.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (!stop_requested.load(std::memory_order_relaxed) &&
+               std::chrono::steady_clock::now() < deadline) {
+            Send(Esp32::Type::Hello, {});
+            const auto attempt_end =
+                std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+            while (!hello_ack && std::chrono::steady_clock::now() < attempt_end) {
+                if (!Pump(20)) {
+                    port.reset();
+                    return false;
+                }
+            }
+            if (hello_ack) {
+                return true;
+            }
+        }
+        port.reset();
+        return false;
+    }
+
+    bool Connected() const {
+        return port != nullptr;
+    }
+
+    // Sends a command; false if the link failed.
+    bool Send(Esp32::Type type, std::span<const u8> payload, u8 flags = 0) {
+        if (!port) {
+            return false;
+        }
+        const std::vector<u8> encoded = Esp32::Encode(type, next_sequence++, flags, payload);
+        if (encoded.empty() || !port->Write(encoded)) {
+            port.reset();
+            return false;
+        }
+        return true;
+    }
+
+    // Sends a command and waits for the device's Status reply. False if the link failed.
+    bool Command(Esp32::Type type, std::span<const u8> payload, const char* name) {
+        if (!Send(type, payload)) {
+            return false;
+        }
+        status_result.reset();
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (!status_result && std::chrono::steady_clock::now() < deadline) {
+            if (!Pump(20)) {
+                return false;
+            }
+        }
+        if (!status_result) {
+            LOG_WARNING(Service_NWM, "UDS Real ESP32: no reply to {}", name);
+        } else if (*status_result != 0) {
+            LOG_WARNING(Service_NWM, "UDS Real ESP32: {} failed on the device, error {}", name,
+                        *status_result);
+        }
+        return true;
+    }
+
+    // Reads and dispatches whatever the device sent. False means the link is gone.
+    bool Pump(int timeout_ms) {
+        if (!port) {
+            return false;
+        }
+        std::array<u8, 2048> buffer;
+        const int count = port->Read(buffer, timeout_ms);
+        if (count < 0) {
+            port.reset();
+            return false;
+        }
+        if (count > 0) {
+            decoder.Feed(std::span<const u8>{buffer.data(), static_cast<std::size_t>(count)},
+                         [this](Esp32::Frame&& frame) { Dispatch(std::move(frame)); });
+        }
+        return true;
+    }
+
+    std::deque<Esp32::Frame> received; // Rx frames awaiting processing.
+    std::optional<Esp32::Frame> hello_ack;
+    std::chrono::steady_clock::time_point last_pong = std::chrono::steady_clock::now();
+    std::unique_ptr<Esp32::SerialPort> port;
+
+private:
+    void Dispatch(Esp32::Frame&& frame) {
+        switch (frame.type) {
+        case Esp32::Type::HelloAck:
+            hello_ack = std::move(frame);
+            break;
+        case Esp32::Type::Status:
+            if (frame.payload.size() >= 5) {
+                s32 result{};
+                std::memcpy(&result, frame.payload.data() + 1, sizeof(result));
+                status_result = result;
+            }
+            break;
+        case Esp32::Type::Rx:
+            received.push_back(std::move(frame));
+            break;
+        case Esp32::Type::Pong:
+            last_pong = std::chrono::steady_clock::now();
+            break;
+        case Esp32::Type::TxDone:
+            if (frame.payload.size() >= 3 + 24) {
+                const std::span<const u8> sent{frame.payload.data() + 3, frame.payload.size() - 3};
+                const u16 frame_control = ReadU16(sent.data());
+                LOG_INFO(Service_NWM,
+                         "UDS Real ESP32: TX result: acked={}, type={}, subtype={}, "
+                         "address1={}, sequence={}, length={}, first {} bytes as sent={}",
+                         frame.payload[0] != 0, (frame_control >> 2) & 0x3,
+                         (frame_control >> 4) & 0xF, FormatMac(sent.data() + 4),
+                         ReadU16(sent.data() + 22) >> 4,
+                         ReadU16(frame.payload.data() + 1), sent.size(),
+                         FormatHexBytes(std::vector<u8>{sent.begin(), sent.end()}));
+            }
+            break;
+        case Esp32::Type::Log:
+            LOG_INFO(Service_NWM, "UDS Real ESP32 firmware: {}",
+                     std::string(frame.payload.begin(), frame.payload.end()));
+            break;
+        case Esp32::Type::Stats:
+            if (const auto stats = Esp32::ParseStats(frame.payload)) {
+                LOG_INFO(Service_NWM,
+                         "UDS Real ESP32 stats: rxSeen={}, rxForwarded={}, rxDropped={}, "
+                         "txOk={}, txFailed={}, beaconsSent={}, usbDropped={}, "
+                         "txUnicast={}, acksRx={}, badFrames={}",
+                         stats->rx_seen, stats->rx_forwarded, stats->rx_dropped, stats->tx_ok,
+                         stats->tx_failed, stats->beacons_sent, stats->usb_dropped,
+                         stats->tx_unicast, stats->acks_rx, decoder.BadFrames());
+            }
+            break;
+        default:
+            break;
+        }
+    }
+
+    std::atomic<bool>& stop_requested;
+    Esp32::Decoder decoder;
+    std::optional<s32> status_result;
+    u8 next_sequence{1};
+};
+
+void RunEsp32Body(std::atomic<bool>& stop_requested, std::atomic<u16>& selected_peer_channel,
+                  u16 requested_channel, const std::array<u8, 6>& local_address,
+                  const Nl80211Monitor::BeaconCallback& beacon_callback,
+                  const Nl80211Monitor::FrameCallback& frame_callback,
+                  const PhysicalBeaconProvider& physical_beacon_provider,
+                  const PhysicalFrameProvider& physical_frame_provider,
+                  const std::function<void()>& discard_access_point_work) {
+    using Clock = std::chrono::steady_clock;
+
+    std::vector<u16> discovery_channels;
+    discovery_channels.push_back(requested_channel);
+    for (const u16 channel : PrimaryDiscoveryChannels) {
+        if (channel != requested_channel) {
+            discovery_channels.push_back(channel);
+        }
+    }
+    std::size_t channel_index = 0;
+    u16 current_channel = requested_channel;
+
+    bool have_recent_nintendo_beacon = false;
+    bool have_active_peer = false;
+    bool have_nintendo_source = false;
+    std::array<u8, 6> nintendo_source{};
+    std::optional<PhysicalBeaconSnapshot> latest_physical_beacon;
+    std::vector<u8> sent_beacon_body;
+    u16 sent_beacon_channel = 0;
+    u16 transmitted_probe_sequence = 0;
+    auto last_nintendo_beacon = Clock::time_point{};
+    auto last_active_peer_frame = Clock::time_point{};
+    auto next_channel_hop = Clock::now() + DiscoveryChannelDwell;
+    auto next_active_probe = Clock::now();
+    auto next_beacon_poll = Clock::now();
+    auto next_ping = Clock::now();
+    std::size_t delivered_beacon_count = 0;
+    std::size_t delivered_frame_count = 0;
+    std::size_t transmitted_frame_count = 0;
+    bool logged_waiting = false;
+
+    Esp32Session session{stop_requested};
+
+    while (!stop_requested.load(std::memory_order_relaxed)) {
+        // (Re)connect. The board can be unplugged and replugged during a session.
+        if (!session.Connected()) {
+            if (!session.Connect()) {
+                if (!logged_waiting) {
+                    LOG_WARNING(Service_NWM,
+                                "UDS Real ESP32: board not found or USB permission missing; "
+                                "retrying until it is attached");
+                    logged_waiting = true;
+                }
+                for (int wait = 0; wait < 20 && !stop_requested.load(std::memory_order_relaxed);
+                     ++wait) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+                continue;
+            }
+            logged_waiting = false;
+            const auto& ack = session.hello_ack->payload;
+            LOG_INFO(Service_NWM, "UDS Real ESP32: connected, protocol={}, firmware={}.{}",
+                     ack.size() > 0 ? ack[0] : 0, ack.size() > 1 ? ack[1] : 0,
+                     ack.size() > 2 ? ack[2] : 0);
+            std::vector<u8> start{static_cast<u8>(current_channel)};
+            start.insert(start.end(), local_address.begin(), local_address.end());
+            // The hardware must NOT own the emulated 3DS's MAC: the chip does not pass unicast
+            // data frames addressed to its own address up to the capture path, which starved the
+            // join handshake (the peer's EAPOL frames never arrived). With a twin address in the
+            // hardware, frames for the emulated MAC are ordinary sniffed traffic and arrive. The
+            // price is that the hardware no longer acknowledges them, so the peer retransmits a
+            // few frames; every unicast frame we send is still acknowledged by the peer.
+            start.push_back(1);
+            if (!session.Command(Esp32::Type::Start, start, "START")) {
+                continue;
+            }
+            if (have_nintendo_source) {
+                session.Send(Esp32::Type::SetWatch, nintendo_source);
+            }
+            sent_beacon_body.clear(); // Force the beacon template to be sent again.
+            session.last_pong = Clock::now();
+            next_ping = Clock::now();
+            LOG_INFO(Service_NWM, "UDS Real ESP32: radio started on channel {} with MAC {}",
+                     current_channel, FormatMac(local_address.data()));
+        }
+
+        discard_access_point_work();
+
+        const auto set_channel = [&](u16 channel) {
+            const std::array<u8, 1> payload{static_cast<u8>(channel)};
+            session.Command(Esp32::Type::SetChannel, payload, "SET_CHANNEL");
+            current_channel = channel;
+        };
+
+        if (const u16 selected_channel =
+                selected_peer_channel.exchange(0, std::memory_order_acq_rel);
+            selected_channel != 0) {
+            // Same policy as the desktop monitor: retune, then hold the channel so the peer's
+            // reply to our first frames is not missed by hopping away.
+            if (selected_channel != current_channel) {
+                set_channel(selected_channel);
+            }
+            if (const auto selected = std::find(discovery_channels.begin(),
+                                                discovery_channels.end(), selected_channel);
+                selected != discovery_channels.end()) {
+                channel_index =
+                    static_cast<std::size_t>(std::distance(discovery_channels.begin(), selected));
+            }
+            have_recent_nintendo_beacon = true;
+            last_nintendo_beacon = Clock::now();
+            next_channel_hop = last_nintendo_beacon + DiscoveryChannelHold;
+            LOG_INFO(Service_NWM,
+                     "UDS Real ESP32: tuned to selected peer channel {} and suspended hopping",
+                     current_channel);
+        }
+
+        // Frames queued by nwm::UDS. The device injects them in order.
+        while (auto pending_frame = physical_frame_provider()) {
+            std::vector<u8> payload;
+            payload.reserve(2 + pending_frame->size());
+            u8 flags = 0;
+            u8 rate = 0;
+            if (IsGroupAddressedFrame(*pending_frame)) {
+                flags |= Esp32::TxNoAck;
+            }
+            if (pending_frame->size() >= 2) {
+                const u16 frame_control = ReadU16(pending_frame->data());
+                const bool is_data = ((frame_control >> 2) & 0x3) == 2;
+                const bool from_ds = (frame_control & 0x0200) != 0;
+                if (is_data && !from_ds) {
+                    rate = ClientDataTxRate500kbps;
+                }
+            }
+            payload.push_back(flags);
+            payload.push_back(rate);
+            payload.insert(payload.end(), pending_frame->begin(), pending_frame->end());
+            if (!session.Send(Esp32::Type::TxFrame, payload)) {
+                break;
+            }
+            ++transmitted_frame_count;
+            {
+                const u16 frame_control =
+                    pending_frame->size() >= 2 ? ReadU16(pending_frame->data()) : 0;
+                const bool management = ((frame_control >> 2) & 0x3) == 0;
+                const bool group_deauth =
+                    management && ((frame_control >> 4) & 0xF) == 12 && (flags & Esp32::TxNoAck);
+                // Management frames carry the join handshake, so every one is logged except the
+                // scan-time broadcast deauthentications; data frames are sampled.
+                if ((management && !group_deauth) || transmitted_frame_count <= 40 ||
+                    transmitted_frame_count % 100 == 0) {
+                    LOG_INFO(Service_NWM,
+                             "UDS Real ESP32: TX #{}, channel={}, type={}, subtype={}, "
+                             "protected={}, toDS={}, fromDS={}, noAck={}, rate={}, "
+                             "frameBytes={}, address1={}, sequence={}",
+                             transmitted_frame_count, current_channel, (frame_control >> 2) & 0x3,
+                             (frame_control >> 4) & 0xF, (frame_control & 0x4000) != 0,
+                             (frame_control & 0x0100) != 0, (frame_control & 0x0200) != 0,
+                             (flags & Esp32::TxNoAck) != 0, rate, pending_frame->size(),
+                             pending_frame->size() >= 10 ? FormatMac(pending_frame->data() + 4)
+                                                          : std::string{},
+                             pending_frame->size() >= 24
+                                 ? ReadU16(pending_frame->data() + 22) >> 4
+                                 : 0);
+                }
+            }
+        }
+        if (!session.Connected()) {
+            continue;
+        }
+
+        // Read what the radio captured. The short timeout bounds the latency of the TX queue
+        // above; Read returns as soon as bytes arrive.
+        if (!session.Pump(3)) {
+            LOG_WARNING(Service_NWM, "UDS Real ESP32: link lost; reconnecting");
+            continue;
+        }
+        while (!session.received.empty()) {
+            const Esp32::Frame rx = std::move(session.received.front());
+            session.received.pop_front();
+            if (rx.payload.size() < 3 + 24) {
+                continue;
+            }
+            const u8 rx_channel = rx.payload[0];
+            std::vector<u8> packet;
+            packet.reserve(RadiotapEmpty.size() + rx.payload.size() - 3);
+            packet.insert(packet.end(), RadiotapEmpty.begin(), RadiotapEmpty.end());
+            packet.insert(packet.end(), rx.payload.begin() + 3, rx.payload.end());
+            const u8 channel = (rx_channel >= 1 && rx_channel <= 14)
+                                   ? rx_channel
+                                   : static_cast<u8>(current_channel);
+
+            if (auto beacon = ParseNintendoBeacon(packet, channel)) {
+                const bool is_echo = latest_physical_beacon &&
+                                     beacon->transmitter_address ==
+                                         latest_physical_beacon->host_address;
+                if (!is_echo) {
+                    ++delivered_beacon_count;
+                    last_nintendo_beacon = Clock::now();
+                    if (!have_recent_nintendo_beacon) {
+                        LOG_INFO(Service_NWM,
+                                 "UDS Real ESP32: Nintendo beacon found; locking discovery to "
+                                 "channel {}",
+                                 beacon->channel);
+                    }
+                    have_recent_nintendo_beacon = true;
+                    if (!have_nintendo_source || nintendo_source != beacon->transmitter_address) {
+                        nintendo_source = beacon->transmitter_address;
+                        have_nintendo_source = true;
+                        session.Send(Esp32::Type::SetWatch, nintendo_source);
+                    }
+                    if (delivered_beacon_count == 1 || delivered_beacon_count % 100 == 0) {
+                        LOG_INFO(Service_NWM,
+                                 "UDS Real ESP32: delivered Nintendo beacon #{}, source={}, "
+                                 "channel={}, wlanCommId=0x{:08X}, id={}",
+                                 delivered_beacon_count,
+                                 FormatMac(beacon->transmitter_address.data()), beacon->channel,
+                                 beacon->wlan_comm_id, beacon->id);
+                    }
+                    beacon_callback(std::move(*beacon));
+                }
+                continue;
+            }
+
+            auto frame = ParseCapturedFrame(packet, channel);
+            if (!frame) {
+                continue;
+            }
+            const bool from_local = frame->transmitter_address == local_address;
+            const bool targets_local = frame->destination_address == local_address;
+            const bool uses_local_bssid = frame->bssid == local_address;
+            const bool uses_discovered_nintendo_bssid =
+                have_nintendo_source && frame->bssid == nintendo_source;
+            const bool is_beacon = frame->type == 0 && frame->subtype == 8;
+            const bool is_probe = frame->type == 0 && (frame->subtype == 4 || frame->subtype == 5);
+            if (from_local || is_beacon || is_probe ||
+                !(targets_local || uses_local_bssid || uses_discovered_nintendo_bssid)) {
+                continue;
+            }
+            last_active_peer_frame = Clock::now();
+            if (!have_active_peer) {
+                LOG_INFO(Service_NWM,
+                         "UDS Real ESP32: active peer traffic found; locking radio to channel {}",
+                         current_channel);
+            }
+            have_active_peer = true;
+            ++delivered_frame_count;
+            if (frame->type == 0 || delivered_frame_count <= 40 ||
+                delivered_frame_count % 100 == 0) {
+                LOG_INFO(Service_NWM,
+                         "UDS Real ESP32: RX #{}, channel={}, type={}, subtype={}, retry={}, "
+                         "protected={}, source={}, destination={}, bssid={}, mpduBytes={}, "
+                         "truncated={}",
+                         delivered_frame_count, current_channel, frame->type, frame->subtype,
+                         (frame->frame_control & 0x0800) != 0,
+                         (frame->frame_control & 0x4000) != 0,
+                         FormatMac(frame->transmitter_address.data()),
+                         FormatMac(frame->destination_address.data()),
+                         FormatMac(frame->bssid.data()), frame->mpdu.size(),
+                         (rx.payload[2] & Esp32::RxTruncated) != 0);
+            }
+            frame_callback(std::move(*frame));
+        }
+
+        const auto now = Clock::now();
+
+        // Keep the device's beacon template current. It transmits it at the beacon interval on
+        // its own, so a slow USB round trip never shows up as a missing beacon.
+        if (now >= next_beacon_poll) {
+            next_beacon_poll = now + std::chrono::milliseconds(50);
+            auto pending_beacon = physical_beacon_provider();
+            if (pending_beacon && pending_beacon->ack_shell_only) {
+                // Client role: the desktop backend needs a hidden beacon to bring up its ACK shell;
+                // the ESP32 acknowledges by MAC and never needs one. Nothing is advertised.
+                pending_beacon.reset();
+            }
+            if (!pending_beacon) {
+                latest_physical_beacon.reset();
+                if (!sent_beacon_body.empty()) {
+                    session.Command(Esp32::Type::SetBeacon, {}, "SET_BEACON(clear)");
+                    sent_beacon_body.clear();
+                }
+            } else {
+                latest_physical_beacon = std::move(*pending_beacon);
+                if (latest_physical_beacon->body != sent_beacon_body ||
+                    sent_beacon_channel != current_channel) {
+                    try {
+                        const std::vector<u8> mpdu = StripRadiotap(GeneratePhysicalNintendoBeacon(
+                            *latest_physical_beacon, 0, static_cast<u8>(current_channel)));
+                        session.Command(Esp32::Type::SetBeacon, mpdu, "SET_BEACON");
+                    } catch (const std::exception& exception) {
+                        LOG_WARNING(Service_NWM, "UDS Real ESP32: bad beacon body: {}",
+                                    exception.what());
+                    }
+                    sent_beacon_body = latest_physical_beacon->body;
+                    sent_beacon_channel = current_channel;
+                }
+            }
+        }
+
+        if (now >= next_ping) {
+            next_ping = now + std::chrono::seconds(2);
+            const std::array<u8, 4> token{1, 2, 3, 4};
+            session.Send(Esp32::Type::Ping, token);
+        }
+        if (now - session.last_pong > std::chrono::seconds(8)) {
+            LOG_WARNING(Service_NWM, "UDS Real ESP32: device stopped answering; reconnecting");
+            session.port.reset();
+            continue;
+        }
+
+        const bool beacon_is_recent =
+            have_recent_nintendo_beacon && now - last_nintendo_beacon < DiscoveryChannelHold;
+        if (have_recent_nintendo_beacon && !beacon_is_recent) {
+            have_recent_nintendo_beacon = false;
+            LOG_INFO(Service_NWM,
+                     "UDS Real ESP32: Nintendo beacon timed out on channel {}; hopping again",
+                     current_channel);
+        }
+        const bool peer_is_recent =
+            have_active_peer && now - last_active_peer_frame < DiscoveryChannelHold;
+        if (have_active_peer && !peer_is_recent) {
+            have_active_peer = false;
+            LOG_INFO(Service_NWM, "UDS Real ESP32: active peer timed out on channel {}",
+                     current_channel);
+        }
+
+        if (beacon_is_recent && now >= next_active_probe) {
+            // The 3DS continuous scanner's directed probe elicits a response from retail hosts.
+            const std::vector<u8> probe = StripRadiotap(GenerateNintendoScanProbeRequest(
+                local_address, transmitted_probe_sequence++, static_cast<u8>(current_channel)));
+            std::vector<u8> payload{Esp32::TxNoAck, 0};
+            payload.insert(payload.end(), probe.begin(), probe.end());
+            session.Send(Esp32::Type::TxFrame, payload);
+            next_active_probe = now + ActiveProbeInterval;
+        }
+
+        if (now < next_channel_hop || beacon_is_recent || peer_is_recent) {
+            continue;
+        }
+        channel_index = (channel_index + 1) % discovery_channels.size();
+        set_channel(discovery_channels[channel_index]);
+        next_channel_hop = Clock::now() + DiscoveryChannelDwell;
+    }
+
+    if (session.Connected()) {
+        session.Command(Esp32::Type::Stop, {}, "STOP");
+    }
+    LOG_INFO(Service_NWM,
+             "UDS Real ESP32: stopped, deliveredBeacons={}, deliveredFrames={}, "
+             "transmittedFrames={}, finalChannel={}",
+             delivered_beacon_count, delivered_frame_count, transmitted_frame_count,
+             current_channel);
+}
+
 } // namespace
 
 struct Nl80211Monitor::Impl {
@@ -2549,7 +3075,7 @@ void Nl80211Monitor::Start(u16 channel, const std::array<u8, 6>& local_address,
     impl->worker = std::thread{[this, channel, local_address,
                                 beacon_callback = std::move(beacon_callback),
                                 frame_callback = std::move(frame_callback)]() mutable {
-#ifdef _WIN32
+#if defined(_WIN32) || defined(ANDROID)
         const PhysicalBeaconProvider physical_beacon_provider = [this]() {
             std::scoped_lock lock{impl->mutex};
             if (!impl->have_pending_beacon) {
@@ -2566,40 +3092,64 @@ void Nl80211Monitor::Start(u16 channel, const std::array<u8, 6>& local_address,
             impl->pending_frames.pop_front();
             return std::optional<std::vector<u8>>{std::move(frame)};
         };
-        const AccessPointConfigurationProvider access_point_config_provider = [this]() {
+        // The ESP32 acknowledges by MAC address, so it never consumes the ACK-shell work that
+        // nwm::UDS queues for the ldnd backend; drop it instead of letting it pile up.
+        const auto discard_access_point_work = [this]() {
             std::scoped_lock lock{impl->mutex};
-            return impl->access_point_config;
-        };
-        const AccessPointActivationProvider access_point_activation_provider = [this]() {
-            std::scoped_lock lock{impl->mutex};
-            const bool requested = impl->access_point_activation_requested;
+            impl->pending_access_point_stations.clear();
+            impl->pending_access_point_data.clear();
             impl->access_point_activation_requested = false;
-            return requested;
         };
-        const AccessPointStationProvider access_point_station_provider = [this]() {
-            std::scoped_lock lock{impl->mutex};
-            if (impl->pending_access_point_stations.empty()) {
-                return std::optional<AccessPointStationRequest>{};
-            }
-            auto request = std::move(impl->pending_access_point_stations.front());
-            impl->pending_access_point_stations.pop_front();
-            return std::optional<AccessPointStationRequest>{std::move(request)};
-        };
-        const AccessPointDataProvider access_point_data_provider = [this]() {
-            std::scoped_lock lock{impl->mutex};
-            if (impl->pending_access_point_data.empty()) {
-                return std::optional<AccessPointDataFrame>{};
-            }
-            auto frame = std::move(impl->pending_access_point_data.front());
-            impl->pending_access_point_data.pop_front();
-            return std::optional<AccessPointDataFrame>{std::move(frame)};
-        };
-        RunMonitorBody(impl->stop_requested, impl->selected_peer_channel, channel,
-                       local_address, beacon_callback,
-                       frame_callback,
-                       physical_beacon_provider, physical_frame_provider,
-                       access_point_config_provider, access_point_activation_provider,
-                       access_point_station_provider, access_point_data_provider);
+        // Android has only the ESP32 backend; on Windows it is chosen in the network settings and
+        // ldnd.exe with a USB Wi-Fi adapter is the default.
+#if defined(ANDROID)
+        constexpr bool use_esp32 = true;
+#else
+        const bool use_esp32 = Settings::values.use_esp32_uds.GetValue();
+#endif
+        if (use_esp32) {
+            RunEsp32Body(impl->stop_requested, impl->selected_peer_channel, channel,
+                         local_address, beacon_callback, frame_callback,
+                         physical_beacon_provider, physical_frame_provider,
+                         discard_access_point_work);
+        }
+#ifdef _WIN32
+        else {
+            const AccessPointConfigurationProvider access_point_config_provider = [this]() {
+                std::scoped_lock lock{impl->mutex};
+                return impl->access_point_config;
+            };
+            const AccessPointActivationProvider access_point_activation_provider = [this]() {
+                std::scoped_lock lock{impl->mutex};
+                const bool requested = impl->access_point_activation_requested;
+                impl->access_point_activation_requested = false;
+                return requested;
+            };
+            const AccessPointStationProvider access_point_station_provider = [this]() {
+                std::scoped_lock lock{impl->mutex};
+                if (impl->pending_access_point_stations.empty()) {
+                    return std::optional<AccessPointStationRequest>{};
+                }
+                auto request = std::move(impl->pending_access_point_stations.front());
+                impl->pending_access_point_stations.pop_front();
+                return std::optional<AccessPointStationRequest>{std::move(request)};
+            };
+            const AccessPointDataProvider access_point_data_provider = [this]() {
+                std::scoped_lock lock{impl->mutex};
+                if (impl->pending_access_point_data.empty()) {
+                    return std::optional<AccessPointDataFrame>{};
+                }
+                auto frame = std::move(impl->pending_access_point_data.front());
+                impl->pending_access_point_data.pop_front();
+                return std::optional<AccessPointDataFrame>{std::move(frame)};
+            };
+            RunMonitorBody(impl->stop_requested, impl->selected_peer_channel, channel,
+                           local_address, beacon_callback, frame_callback,
+                           physical_beacon_provider, physical_frame_provider,
+                           access_point_config_provider, access_point_activation_provider,
+                           access_point_station_provider, access_point_data_provider);
+        }
+#endif
 #else
         (void)channel;
         (void)beacon_callback;
