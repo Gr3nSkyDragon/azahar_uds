@@ -7,9 +7,9 @@ This fork and its primary unique feature(s) were coded using LLM generated mater
 # How to run
 
 ### Prerequisites
-You'll need to set up ldnd.exe from [unlimitedcoder2](https://gist.github.com/unlimitedcoder2/af2f09694563c6a6cd3d3e9ec45750bd). You'll need to follow the steps in that repository to set up your USB Wi-Fi adapter (you will need a compatible USB Wi-Fi adapter). I've been using a cheap/generic AC1300 adapter in my testing. This is a Windows-only program. If you have experience with Linux, you can probably convert it to be Linux-compatible fairly easily. 
+If you don't have an ESP32-S3, you'll need to set up ldnd.exe from [unlimitedcoder2](https://gist.github.com/unlimitedcoder2/af2f09694563c6a6cd3d3e9ec45750bd). You'll need to follow the steps in that repository to set up your USB Wi-Fi adapter (you will need a compatible USB Wi-Fi adapter). I've been using a cheap/generic AC1300 adapter in my testing. This is a Windows-only program. If you have experience with Linux, you can probably convert it to be Linux-compatible fairly easily. 
 
-If I haven't included an Azahar.exe in the releases, you'll need to build your own. This guide assumes you have the necessary hardware and can get ldnd.exe working on your own. 
+If you're using the ESP32-S3, you'll need to either download the [ESP-IDF v5.2.8](https://dl.espressif.com/dl/esp-idf/) installer or use a web-based tool like [esptool](https://espressif.github.io/esptool-js/) to flash the firmware. In Azahar, you'll need to go to Emulation > Configure > General > Network, and check the ESP32 box. Click "Connect" to verify that Azahar can find your ESP32. 
 
 Gen 6 and 7 trading now work. I've personally confirmed the following:
 1) Trading between X and Y
