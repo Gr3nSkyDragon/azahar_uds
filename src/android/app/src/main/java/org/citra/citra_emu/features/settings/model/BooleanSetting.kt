@@ -132,7 +132,8 @@ enum class BooleanSetting(
         Settings.SECTION_RENDERER,
         false
     ),
-    CHECK_FOR_UPDATES(SettingKeys.check_for_update_on_start(), Settings.SECTION_MISC, true);
+    // Off by default: the checker compares against official Azahar releases, not this fork.
+    CHECK_FOR_UPDATES(SettingKeys.check_for_update_on_start(), Settings.SECTION_MISC, false);
 
     override var boolean: Boolean = defaultValue
 

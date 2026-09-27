@@ -61,13 +61,16 @@ android {
     }
 
     defaultConfig {
-        // The application ID refers to Lime3DS to allow for
-        // the Play Store listing, which was originally set up for Lime3DS, to still be used.
-        applicationId = "org.azahar_emu.azahar"
+        // Deliberately unrelated to official Azahar (org.azahar_emu.azahar) so this fork is a
+        // separate app: some vendor installers reject an "unofficial" build that resembles it.
+        applicationId = "dev.gr3nskydragon.azaharuds"
         minSdk = 29
-        targetSdk = 37
+        // Upstream targets Android 17 (37), but Honor's installer rejects that on older Android
+        // releases; 34 matches the mGBA LDN app that installs fine there.
+        targetSdk = 34
         versionCode = autoVersion
-        versionName = getGitVersion()
+        // Release-style name (upstream base + fork tag) instead of a bare git hash.
+        versionName = "2126.1.2-uds"
 
         ndk {
             //noinspection ChromeOsAbiSupport
@@ -180,7 +183,6 @@ android {
         register("googlePlay") {
             dimension = "version"
             versionNameSuffix = "-googleplay"
-            applicationId = "io.github.lime3ds.android"
         }
     }
 

@@ -28,3 +28,7 @@
 -assumenosideeffects class android.util.Log {
     public static int v(...);
 }
+
+# The ESP32 USB link (utils/Esp32UsbLink.kt) is called back from native code
+# (jni/esp32_usb_serial.cpp), so the shrinker cannot see that open/close/read/write are used.
+-keep class org.citra.citra_emu.utils.Esp32UsbLink { *; }

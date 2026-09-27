@@ -29,7 +29,7 @@ import org.citra.citra_emu.CitraApplication
 object Esp32UsbLink {
     private const val VID_ESPRESSIF = 0x303A
     private const val PID_USB_JTAG = 0x1001
-    private const val ACTION_USB_PERMISSION = "org.azahar_emu.azahar.USB_PERMISSION"
+    private const val ACTION_USB_PERMISSION = "dev.gr3nskydragon.azaharuds.USB_PERMISSION"
 
     private val lock = Any()
     private var connection: UsbDeviceConnection? = null
