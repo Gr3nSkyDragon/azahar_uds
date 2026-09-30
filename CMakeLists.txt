@@ -117,7 +117,10 @@ foreach(_opt IN LISTS _LIBRETRO_INCOMPATIBLE_OPTIONS)
 endforeach()
 
 option(ENABLE_SDL2 "Enable using SDL2" ON)
+option(USE_SYSTEM_FAAD "Use the system faad2 lib (instead of the bundled one)" OFF)
 option(USE_SYSTEM_SDL2 "Use the system SDL2 lib (instead of the bundled one)" OFF)
+option(USE_SYSTEM_SPIRV_TOOLS "Use the system SPIRV-Tools lib (instead of the bundled one)" OFF)
+option(USE_SYSTEM_XXHASH "Use the system xxHash lib (instead of the bundled one)" OFF)
 
 # Set bundled qt as dependent options.
 option(ENABLE_QT "Enable the Qt frontend" ON)
@@ -159,6 +162,7 @@ option(ENABLE_NATIVE_OPTIMIZATION "Enables processor-specific optimizations via 
 option(CITRA_USE_PRECOMPILED_HEADERS "Use precompiled headers" ON)
 option(CITRA_WARNINGS_AS_ERRORS "Enable warnings as errors" ON)
 option(CITRA_ADDRESS_SANITIZE "Enable address sanitizer" OFF)
+option(ENABLE_CCACHE "Use ccache to speed up subsequent builds" OFF)
 
 # Handle incompatible options for libretro builds
 if(ENABLE_LIBRETRO)
@@ -228,12 +232,20 @@ if(NOT EXISTS ${PROJECT_SOURCE_DIR}/.git/hooks/pre-commit)
         DESTINATION ${PROJECT_SOURCE_DIR}/.git/hooks)
 endif()
 
-# Use ccache for android if available
+# Use ccache if the user requests it, or if NDK_CCACHE is set on Android
 # =======================================================================
 if (NOT $ENV{NDK_CCACHE} EQUAL "")
-    set(CCACHE_EXE $ENV{NDK_CCACHE})
-    set(CMAKE_C_COMPILER_LAUNCHER ${CCACHE_EXE})
-    set(CMAKE_CXX_COMPILER_LAUNCHER ${CCACHE_EXE})
+    set(CMAKE_C_COMPILER_LAUNCHER ${NDK_CCACHE})
+    set(CMAKE_CXX_COMPILER_LAUNCHER ${NDK_CCACHE})
+elseif (ENABLE_CCACHE)
+    find_program(CCACHE_BINARY ccache)
+    if (CCACHE_BINARY)
+        message(STATUS "Found ccache")
+        set(CMAKE_C_COMPILER_LAUNCHER ${CCACHE_BINARY})
+        set(CMAKE_CXX_COMPILER_LAUNCHER ${CCACHE_BINARY})
+    else()
+        message(FATAL_ERROR "ENABLE_CCACHE is on, but ccache was not found.")
+    endif()
 endif()
 
 # Check for LTO support
@@ -577,6 +589,16 @@ if (USE_SYSTEM_SOUNDTOUCH)
     add_library(SoundTouch INTERFACE)
     target_link_libraries(SoundTouch INTERFACE "${SOUNDTOUCH_LIBRARIES}")
     target_include_directories(SoundTouch INTERFACE "${SOUNDTOUCH_INCLUDE_DIRS}")
+endif()
+
+if (USE_SYSTEM_XXHASH)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(libxxhash_PKGCONFIG IMPORTED_TARGET libxxhash REQUIRED)
+endif()
+
+if (USE_SYSTEM_FAAD)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(libfaad_PKGCONFIG IMPORTED_TARGET faad2 REQUIRED)
 endif()
 
 add_subdirectory(src)
