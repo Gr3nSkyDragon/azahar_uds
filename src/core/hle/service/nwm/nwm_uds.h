@@ -20,6 +20,7 @@
 #include "common/common_types.h"
 #include "common/swap.h"
 #include "common/threadsafe_queue.h"
+#include "core/hle/service/nwm/uds_bridge.h"
 #include "core/hle/service/nwm/uds_common.h"
 #include "core/hle/service/service.h"
 #include "network/network.h"
@@ -134,7 +135,9 @@ struct NetworkInfo {
     // This field is received as BigEndian from the game.
     u32_be wlan_comm_id;
     u8 id;
-    INSERT_PADDING_BYTES(1);
+    // Retail NWM counts the changes to a hosted network here: 1 when the network is created, plus
+    // one for every node that joins or leaves (seen as 1, 2, 3 in a retail Pokemon trade).
+    u8 update_counter;
     u16_be attributes;
     u32_be network_id;
     u8 total_nodes;
@@ -725,6 +728,9 @@ private:
 
     // Physical nl80211 monitor used by the experimental UDS Real backend.
     std::unique_ptr<UdsReal::Nl80211Monitor> real_monitor;
+
+    // Localhost UDP link to the mGBA Virtual Console wrapper (AZAHAR_UDS_BRIDGE); replaces the radio.
+    std::unique_ptr<UdsBridge> bridge;
     std::optional<std::array<u8, 16>> physical_data_ccmp_key;
 
     // Passive sniffer state (see StartSniffMonitor).

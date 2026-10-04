@@ -231,6 +231,10 @@ void NWM_UDS::SendPacket(Network::WifiPacket& packet) {
         }
     }
 
+    if (bridge) {
+        bridge->Send(packet);
+    }
+
 #if UDS_REAL_BACKEND
     SendPhysicalPacket(packet);
 #endif
@@ -422,6 +426,7 @@ void NWM_UDS::HandleEAPoLPacket(const Network::WifiPacket& packet) {
 
             node_info[node_id - 1] = node;
             network_info.total_nodes++;
+            ++network_info.update_counter;
 
             node_map[packet.transmitter_address].node_id = node.network_node_id;
             node_map[packet.transmitter_address].connected = true;
@@ -931,6 +936,7 @@ void NWM_UDS::HandleDeauthenticationFrame(const Network::WifiPacket& packet) {
         connection_status.nodes[node.node_id - 1] = 0;
 
         network_info.total_nodes--;
+        ++network_info.update_counter;
         // TODO(B3N30): broadcast new connection_status to clients
     }
     node_it->Reset();
@@ -1478,7 +1484,7 @@ u32 SniffBigEndian32(const u8* p) {
 } // namespace
 
 void NWM_UDS::StartSniffMonitor() {
-    if (!real_monitor && UdsReal::IsPhysicalBackendEnabled()) {
+    if (!real_monitor && !bridge && UdsReal::IsPhysicalBackendEnabled()) {
         real_monitor = std::make_unique<UdsReal::Nl80211Monitor>();
     }
     if (!real_monitor) {
@@ -1863,7 +1869,7 @@ ResultVal<std::shared_ptr<Kernel::Event>> NWM_UDS::Initialize(
     }
 
 #if UDS_REAL_BACKEND
-    if (!real_monitor && UdsReal::IsPhysicalBackendEnabled()) {
+    if (!real_monitor && !bridge && UdsReal::IsPhysicalBackendEnabled()) {
         real_monitor = std::make_unique<UdsReal::Nl80211Monitor>();
     }
     ++monitor_linger_generation; // Cancel any pending idle stop; we're using the monitor again.
@@ -2183,6 +2189,7 @@ Result NWM_UDS::BeginHostingNetwork(std::span<const u8> network_info_buffer,
         // There's currently only one node in the network (the host).
         connection_status.total_nodes = 1;
         network_info.total_nodes = 1;
+        network_info.update_counter = 1;
 
         // The host is always the first node
         connection_status.network_node_id = 1;
@@ -3278,9 +3285,14 @@ NWM_UDS::NWM_UDS(Core::System& system) : ServiceFramework("nwm::UDS"), system(sy
     } else {
         LOG_ERROR(Service_NWM, "Network isn't initalized");
     }
+
+    bridge = UdsBridge::CreateFromEnvironment(
+        [this](const Network::WifiPacket& packet) { OnWifiPacketReceived(packet); });
 }
 
 NWM_UDS::~NWM_UDS() {
+    bridge.reset(); // Stop its receive thread before anything it calls into goes away.
+
 #if UDS_REAL_BACKEND
     if (real_monitor) {
         real_monitor->Stop();

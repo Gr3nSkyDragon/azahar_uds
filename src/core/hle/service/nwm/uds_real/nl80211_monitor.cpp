@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <iterator>
@@ -931,6 +932,36 @@ RadiotapSignal DescribeRadiotapSignal(const std::vector<u8>& packet) {
 // data on the air too long, and 54 Mbps got no replies from the retail host.
 constexpr u8 ClientDataTxRate500kbps = 22;
 
+// Transmit rate for game data frames the host sends (FromDS data). A retail host sends them at
+// 24 Mbps OFDM (302 of 303 data frames in the passive capture of a 3DS XL hosting VC Red); the
+// injection default of 1 Mbps keeps a 25-unit window (about 1.4 KB) on the air for 12 ms instead of
+// 0.5 ms and the retail joiner lost or delayed many of them. Set AZAHAR_UDS_HOST_RATE to a rate in
+// 500 kbps units (22 = 11 Mbps, 48 = 24 Mbps, 0 = driver default) to experiment without a rebuild.
+constexpr u8 HostDataTxRate500kbps = 48;
+
+u8 HostDataTxRate() {
+    static const u8 rate = [] {
+        if (const char* value = std::getenv("AZAHAR_UDS_HOST_RATE")) {
+            return static_cast<u8>(std::strtoul(value, nullptr, 10));
+        }
+        return HostDataTxRate500kbps;
+    }();
+    return rate;
+}
+
+// Fixed transmit rate for an outgoing frame in 500 kbps units, or 0 for the driver/firmware default.
+// Only data frames are touched; management frames keep the default rate.
+u8 DataTxRate500kbps(std::span<const u8> frame) {
+    if (frame.size() < 2) {
+        return 0;
+    }
+    const u16 frame_control = ReadU16(frame.data());
+    if (((frame_control >> 2) & 0x3) != 2) {
+        return 0;
+    }
+    return (frame_control & 0x0200) != 0 ? HostDataTxRate() : ClientDataTxRate500kbps;
+}
+
 std::optional<RadiotapInfo> ParseRadiotap(const std::vector<u8>& packet) {
     if (packet.size() < 8 || packet[0] != 0 || packet[1] != 0) {
         return std::nullopt;
@@ -1086,6 +1117,25 @@ std::vector<u8> GenerateNintendoScanProbeRequest(const std::array<u8, 6>& source
     frame.push_back(1);
     frame.push_back(channel);
     return frame;
+}
+
+// Returns the channel in the DS parameter set of a generated UDS beacon body, or 0 if it has none.
+u8 BeaconDsChannel(const std::vector<u8>& body) {
+    constexpr std::size_t BeaconFixedParametersSize = 12;
+    std::size_t offset = BeaconFixedParametersSize;
+    while (offset + 2 <= body.size()) {
+        const u8 tag = body[offset];
+        const u8 length = body[offset + 1];
+        offset += 2;
+        if (offset + length > body.size()) {
+            return 0;
+        }
+        if (tag == 3 && length >= 1) {
+            return body[offset];
+        }
+        offset += length;
+    }
+    return 0;
 }
 
 std::vector<u8> GeneratePhysicalNintendoBeacon(const PhysicalBeaconSnapshot& beacon,
@@ -1282,16 +1332,10 @@ std::vector<u8> AddRadiotapHeader(std::span<const u8> frame, bool no_ack) {
     constexpr u32 RadiotapPresentTxFlags = 1U << 15;
     constexpr u16 RadiotapTxNoAck = 0x0008;
 
-    // Optional experiment: fixed rate for data frames a client originates (NoDS/ToDS). Frames a
-    // host sends (FromDS) and all management frames keep the driver's default rate.
+    // Fixed rates for data frames (see DataTxRate500kbps); management frames keep the default.
     std::optional<u8> rate;
-    if (frame.size() >= 2) {
-        const u16 frame_control = ReadU16(frame.data());
-        const bool is_data = ((frame_control >> 2) & 0x3) == 2;
-        const bool from_ds = (frame_control & 0x0200) != 0;
-        if (is_data && !from_ds) {
-            rate = ClientDataTxRate500kbps;
-        }
+    if (const u8 data_rate = DataTxRate500kbps(frame); data_rate != 0) {
+        rate = data_rate;
     }
 
     u32 present = 0;
@@ -2024,8 +2068,25 @@ std::vector<u8> AddRadiotapHeader(std::span<const u8> frame, bool no_ack) {
                         std::memcpy(radio_transmitter.data(),
                                     packet.data() + radiotap->length + 10, 6);
                         const bool radio_local = radio_transmitter == local_address;
+                        // While Azahar hosts, the peer is the joiner: its frames carry our MAC as the
+                        // BSSID. UDS data frames use the ad-hoc layout (BSSID in address 3), joins use
+                        // address 1 or 2 depending on the DS bits.
+                        bool radio_to_host = false;
+                        if (!radio_local && latest_physical_beacon &&
+                            !latest_physical_beacon->ack_shell_only &&
+                            packet.size() >= radiotap->length + 24) {
+                            const bool to_ds = (radio_frame_control & 0x0100) != 0;
+                            const bool from_ds = (radio_frame_control & 0x0200) != 0;
+                            const std::size_t bssid_offset =
+                                (!to_ds && !from_ds) ? 16 : (to_ds && !from_ds) ? 4 : 10;
+                            radio_to_host = !(to_ds && from_ds) &&
+                                            std::memcmp(packet.data() + radiotap->length +
+                                                            bssid_offset,
+                                                        local_address.data(), 6) == 0;
+                        }
                         const bool radio_retail =
-                            have_nintendo_source && radio_transmitter == nintendo_source;
+                            (have_nintendo_source && radio_transmitter == nintendo_source) ||
+                            radio_to_host;
                         if (radio_retail) {
                             // Capture completeness: the retail host numbers every frame it sends
                             // (beacons and data) consecutively, so a gap in what we captured is a
@@ -2033,24 +2094,58 @@ std::vector<u8> AddRadiotapHeader(std::span<const u8> frame, bool no_ack) {
                             static int last_seq = -1;
                             static std::size_t seen = 0;
                             static std::size_t missed = 0;
+                            static std::size_t retries = 0;
+                            static std::size_t dsss_frames = 0;  // 1, 2, 5.5 and 11 Mbit/s
+                            static std::size_t ofdm_frames = 0;  // 6 Mbit/s and up
+                            static int signal_sum = 0;
+                            static std::size_t signal_count = 0;
                             static auto window_start = std::chrono::steady_clock::now();
                             const int seq = ReadU16(packet.data() + radiotap->length + 22) >> 4;
-                            if (last_seq >= 0) {
+                            const bool seq_retry = (radio_frame_control & 0x0800) != 0;
+                            if (last_seq >= 0 && !seq_retry) {
                                 const int gap = (seq - last_seq) & 0xFFF;
                                 if (gap > 1 && gap < 64) {
                                     missed += static_cast<std::size_t>(gap - 1);
                                 }
                             }
-                            last_seq = seq;
+                            if (!seq_retry) {
+                                last_seq = seq;
+                            }
                             ++seen;
+                            if (seq_retry) {
+                                ++retries;
+                            }
+                            {
+                                const auto radio = DescribeRadiotapSignal(packet);
+                                if (radio.rate_500kbps) {
+                                    const u8 rate = *radio.rate_500kbps;
+                                    if (rate == 2 || rate == 4 || rate == 11 || rate == 22) {
+                                        ++dsss_frames;
+                                    } else {
+                                        ++ofdm_frames;
+                                    }
+                                }
+                                if (radio.signal_dbm) {
+                                    signal_sum += *radio.signal_dbm;
+                                    ++signal_count;
+                                }
+                            }
                             const auto now = std::chrono::steady_clock::now();
                             if (now - window_start >= std::chrono::seconds(3)) {
                                 LOG_INFO(Service_NWM,
                                          "UDS Real RADIO retail-capture: last 3s captured={}, "
-                                         "missedByGap={}",
-                                         seen, missed);
+                                         "missedByGap={}, retries={}, dsssFrames={}, ofdmFrames={}, "
+                                         "meanSignalDbm={}",
+                                         seen, missed, retries, dsss_frames, ofdm_frames,
+                                         signal_count ? signal_sum / static_cast<int>(signal_count)
+                                                      : 0);
                                 seen = 0;
                                 missed = 0;
+                                retries = 0;
+                                dsss_frames = 0;
+                                ofdm_frames = 0;
+                                signal_sum = 0;
+                                signal_count = 0;
                                 window_start = now;
                             }
                         }
@@ -2375,6 +2470,29 @@ std::vector<u8> AddRadiotapHeader(std::span<const u8> frame, bool no_ack) {
                              current_channel, probe_request.size());
                 }
                 next_active_probe = now + ActiveProbeInterval;
+            }
+            // A hosted network stays on its own channel, as a retail host does. Hopping would put
+            // the beacons on channels 1, 6 and 11 in turn, each advertising a different channel.
+            if (latest_physical_beacon && !latest_physical_beacon->ack_shell_only) {
+                const u8 hosted_channel = BeaconDsChannel(latest_physical_beacon->body);
+                if (hosted_channel != 0 && hosted_channel != current_channel && !peer_is_recent &&
+                    !access_point_started && now >= next_channel_hop) {
+                    try {
+                        SetChannel(connection, generic_socket_id, port_id, family_id,
+                                   monitor_ifindex, ChannelToFrequency(hosted_channel), sequence);
+                        LOG_INFO(Service_NWM,
+                                 "UDS Real: hosting; tuned from channel {} to the network channel "
+                                 "{} and stopped hopping",
+                                 current_channel, hosted_channel);
+                        current_channel = hosted_channel;
+                    } catch (const std::exception& exception) {
+                        LOG_WARNING(Service_NWM,
+                                    "UDS Real: could not tune to hosted channel {}: {}",
+                                    hosted_channel, exception.what());
+                    }
+                    next_channel_hop = std::chrono::steady_clock::now() + DiscoveryChannelDwell;
+                }
+                continue;
             }
             if (now < next_channel_hop || beacon_is_recent || peer_is_recent ||
                 access_point_started) {
@@ -2793,17 +2911,9 @@ void RunEsp32Body(std::atomic<bool>& stop_requested, std::atomic<u16>& selected_
             std::vector<u8> payload;
             payload.reserve(2 + pending_frame->size());
             u8 flags = 0;
-            u8 rate = 0;
+            const u8 rate = DataTxRate500kbps(*pending_frame);
             if (IsGroupAddressedFrame(*pending_frame)) {
                 flags |= Esp32::TxNoAck;
-            }
-            if (pending_frame->size() >= 2) {
-                const u16 frame_control = ReadU16(pending_frame->data());
-                const bool is_data = ((frame_control >> 2) & 0x3) == 2;
-                const bool from_ds = (frame_control & 0x0200) != 0;
-                if (is_data && !from_ds) {
-                    rate = ClientDataTxRate500kbps;
-                }
             }
             payload.push_back(flags);
             payload.push_back(rate);

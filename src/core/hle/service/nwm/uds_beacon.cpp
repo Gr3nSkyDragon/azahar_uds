@@ -56,10 +56,13 @@ std::vector<u8> GenerateFixedParameters() {
 }
 
 /**
- * Generates the 8-byte hexadecimal UDS network SSID tag of an 802.11 Beacon frame.
+ * Generates the 8-byte UDS SSID tag of an 802.11 Beacon frame.
+ * A retail host (3DS XL, VC Pokemon Red, captured passively) broadcasts eight zero bytes here. The
+ * network id only appears as an ASCII hexadecimal SSID in the association request a client sends
+ * after it has read the id from the Nintendo network info tag.
  * @returns A buffer with the SSID tag.
  */
-std::vector<u8> GenerateSSIDTag(const NetworkInfo& network_info) {
+std::vector<u8> GenerateSSIDTag() {
     std::vector<u8> buffer(sizeof(TagHeader) + UDSBeaconSSIDSize);
 
     TagHeader tag_header{};
@@ -67,18 +70,6 @@ std::vector<u8> GenerateSSIDTag(const NetworkInfo& network_info) {
     tag_header.length = UDSBeaconSSIDSize;
 
     std::memcpy(buffer.data(), &tag_header, sizeof(TagHeader));
-
-    // A retail UDS host advertises its network id as an eight-character uppercase hexadecimal
-    // SSID. Clients use this SSID when they later join the selected network.
-    constexpr std::array<char, 16> HexDigits = {'0', '1', '2', '3', '4', '5', '6', '7',
-                                                '8', '9', 'A', 'B', 'C', 'D', 'E', 'F'};
-    const u32 network_id = network_info.network_id;
-    for (std::size_t index = 0; index < UDSBeaconSSIDSize; ++index) {
-        const std::size_t shift = (UDSBeaconSSIDSize - index - 1) * 4;
-        buffer[sizeof(TagHeader) + index] =
-            static_cast<u8>(HexDigits[(network_id >> shift) & 0xF]);
-    }
-
     return buffer;
 }
 
@@ -88,12 +79,12 @@ std::vector<u8> GenerateSSIDTag(const NetworkInfo& network_info) {
  * @returns A buffer with the tagged parameters of the beacon frame.
  */
 std::vector<u8> GenerateBasicTaggedParameters(const NetworkInfo& network_info) {
-    // Append the SSID tag
-    std::vector<u8> buffer = GenerateSSIDTag(network_info);
+    // The tags and their order match a retail 3DS XL hosting VC Pokemon Red (passive capture): SSID,
+    // supported rates, DS parameter set, TIM, country, ERP. There is no extended rates tag.
+    std::vector<u8> buffer = GenerateSSIDTag();
 
-    // Common 2.4 GHz supported rates: 1, 2, 5.5, 11, 6, 9, 12 and 18 Mbit/s.
-    constexpr std::array<u8, 8> SupportedRates{0x82, 0x84, 0x8B, 0x96,
-                                               0x0C, 0x12, 0x18, 0x24};
+    // 11, 12, 18, 24, 36, 48 and 54 Mbit/s, with 11 Mbit/s and 12 Mbit/s marked as basic rates.
+    constexpr std::array<u8, 7> SupportedRates{0x96, 0x98, 0xA4, 0xB0, 0xC8, 0xE0, 0xEC};
     buffer.push_back(static_cast<u8>(TagId::SupportedRates));
     buffer.push_back(static_cast<u8>(SupportedRates.size()));
     buffer.insert(buffer.end(), SupportedRates.begin(), SupportedRates.end());
@@ -102,22 +93,22 @@ std::vector<u8> GenerateBasicTaggedParameters(const NetworkInfo& network_info) {
     buffer.push_back(1);
     buffer.push_back(network_info.channel);
 
-    // A minimal valid TIM for a network with no buffered unicast or multicast traffic.
-    constexpr std::array<u8, 4> TrafficIndicationMap{0, 1, 0, 0};
+    // DTIM count 0, DTIM period 1, bitmap control 1 (the retail host flags buffered multicast), empty
+    // partial virtual bitmap.
+    constexpr std::array<u8, 4> TrafficIndicationMap{0, 1, 1, 0};
     buffer.push_back(static_cast<u8>(TagId::TrafficIndicationMap));
     buffer.push_back(static_cast<u8>(TrafficIndicationMap.size()));
     buffer.insert(buffer.end(), TrafficIndicationMap.begin(), TrafficIndicationMap.end());
 
-    // ERP information and the remaining common OFDM rates.
+    // Country "JP" (third octet 0), channels 1 to 13, maximum transmit power 20 dBm.
+    constexpr std::array<u8, 6> CountryInformation{'J', 'P', 0x00, 0x01, 0x0D, 0x14};
+    buffer.push_back(static_cast<u8>(TagId::CountryInformation));
+    buffer.push_back(static_cast<u8>(CountryInformation.size()));
+    buffer.insert(buffer.end(), CountryInformation.begin(), CountryInformation.end());
+
     buffer.push_back(static_cast<u8>(TagId::ERPInformation));
     buffer.push_back(1);
     buffer.push_back(0);
-    constexpr std::array<u8, 4> ExtendedRates{0x30, 0x48, 0x60, 0x6C};
-    buffer.push_back(50); // Extended Supported Rates.
-    buffer.push_back(static_cast<u8>(ExtendedRates.size()));
-    buffer.insert(buffer.end(), ExtendedRates.begin(), ExtendedRates.end());
-
-    // TODO(Subv): Add the CountryInformation tag.
 
     return buffer;
 }
