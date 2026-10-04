@@ -418,6 +418,8 @@ add_library(citra_core STATIC EXCLUDE_FROM_ALL
     hle/service/nwm/uds_real/uds_real_config.h
     hle/service/nwm/uds_beacon.cpp
     hle/service/nwm/uds_beacon.h
+    hle/service/nwm/uds_bridge.cpp
+    hle/service/nwm/uds_bridge.h
     hle/service/nwm/uds_connection.cpp
     hle/service/nwm/uds_connection.h
     hle/service/nwm/uds_data.cpp

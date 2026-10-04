@@ -231,6 +231,10 @@ void NWM_UDS::SendPacket(Network::WifiPacket& packet) {
         }
     }
 
+    if (bridge) {
+        bridge->Send(packet);
+    }
+
 #if UDS_REAL_BACKEND
     SendPhysicalPacket(packet);
 #endif
@@ -1480,7 +1484,7 @@ u32 SniffBigEndian32(const u8* p) {
 } // namespace
 
 void NWM_UDS::StartSniffMonitor() {
-    if (!real_monitor && UdsReal::IsPhysicalBackendEnabled()) {
+    if (!real_monitor && !bridge && UdsReal::IsPhysicalBackendEnabled()) {
         real_monitor = std::make_unique<UdsReal::Nl80211Monitor>();
     }
     if (!real_monitor) {
@@ -1865,7 +1869,7 @@ ResultVal<std::shared_ptr<Kernel::Event>> NWM_UDS::Initialize(
     }
 
 #if UDS_REAL_BACKEND
-    if (!real_monitor && UdsReal::IsPhysicalBackendEnabled()) {
+    if (!real_monitor && !bridge && UdsReal::IsPhysicalBackendEnabled()) {
         real_monitor = std::make_unique<UdsReal::Nl80211Monitor>();
     }
     ++monitor_linger_generation; // Cancel any pending idle stop; we're using the monitor again.
@@ -3281,9 +3285,14 @@ NWM_UDS::NWM_UDS(Core::System& system) : ServiceFramework("nwm::UDS"), system(sy
     } else {
         LOG_ERROR(Service_NWM, "Network isn't initalized");
     }
+
+    bridge = UdsBridge::CreateFromEnvironment(
+        [this](const Network::WifiPacket& packet) { OnWifiPacketReceived(packet); });
 }
 
 NWM_UDS::~NWM_UDS() {
+    bridge.reset(); // Stop its receive thread before anything it calls into goes away.
+
 #if UDS_REAL_BACKEND
     if (real_monitor) {
         real_monitor->Stop();

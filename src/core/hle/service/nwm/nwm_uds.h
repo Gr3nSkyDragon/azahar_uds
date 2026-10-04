@@ -20,6 +20,7 @@
 #include "common/common_types.h"
 #include "common/swap.h"
 #include "common/threadsafe_queue.h"
+#include "core/hle/service/nwm/uds_bridge.h"
 #include "core/hle/service/nwm/uds_common.h"
 #include "core/hle/service/service.h"
 #include "network/network.h"
@@ -727,6 +728,9 @@ private:
 
     // Physical nl80211 monitor used by the experimental UDS Real backend.
     std::unique_ptr<UdsReal::Nl80211Monitor> real_monitor;
+
+    // Localhost UDP link to the mGBA Virtual Console wrapper (AZAHAR_UDS_BRIDGE); replaces the radio.
+    std::unique_ptr<UdsBridge> bridge;
     std::optional<std::array<u8, 16>> physical_data_ccmp_key;
 
     // Passive sniffer state (see StartSniffMonitor).
