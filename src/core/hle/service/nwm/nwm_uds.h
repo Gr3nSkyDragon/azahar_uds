@@ -134,7 +134,9 @@ struct NetworkInfo {
     // This field is received as BigEndian from the game.
     u32_be wlan_comm_id;
     u8 id;
-    INSERT_PADDING_BYTES(1);
+    // Retail NWM counts the changes to a hosted network here: 1 when the network is created, plus
+    // one for every node that joins or leaves (seen as 1, 2, 3 in a retail Pokemon trade).
+    u8 update_counter;
     u16_be attributes;
     u32_be network_id;
     u8 total_nodes;

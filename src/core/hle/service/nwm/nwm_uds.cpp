@@ -422,6 +422,7 @@ void NWM_UDS::HandleEAPoLPacket(const Network::WifiPacket& packet) {
 
             node_info[node_id - 1] = node;
             network_info.total_nodes++;
+            ++network_info.update_counter;
 
             node_map[packet.transmitter_address].node_id = node.network_node_id;
             node_map[packet.transmitter_address].connected = true;
@@ -931,6 +932,7 @@ void NWM_UDS::HandleDeauthenticationFrame(const Network::WifiPacket& packet) {
         connection_status.nodes[node.node_id - 1] = 0;
 
         network_info.total_nodes--;
+        ++network_info.update_counter;
         // TODO(B3N30): broadcast new connection_status to clients
     }
     node_it->Reset();
@@ -2183,6 +2185,7 @@ Result NWM_UDS::BeginHostingNetwork(std::span<const u8> network_info_buffer,
         // There's currently only one node in the network (the host).
         connection_status.total_nodes = 1;
         network_info.total_nodes = 1;
+        network_info.update_counter = 1;
 
         // The host is always the first node
         connection_status.network_node_id = 1;

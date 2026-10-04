@@ -1088,6 +1088,25 @@ std::vector<u8> GenerateNintendoScanProbeRequest(const std::array<u8, 6>& source
     return frame;
 }
 
+// Returns the channel in the DS parameter set of a generated UDS beacon body, or 0 if it has none.
+u8 BeaconDsChannel(const std::vector<u8>& body) {
+    constexpr std::size_t BeaconFixedParametersSize = 12;
+    std::size_t offset = BeaconFixedParametersSize;
+    while (offset + 2 <= body.size()) {
+        const u8 tag = body[offset];
+        const u8 length = body[offset + 1];
+        offset += 2;
+        if (offset + length > body.size()) {
+            return 0;
+        }
+        if (tag == 3 && length >= 1) {
+            return body[offset];
+        }
+        offset += length;
+    }
+    return 0;
+}
+
 std::vector<u8> GeneratePhysicalNintendoBeacon(const PhysicalBeaconSnapshot& beacon,
                                                u16 sequence_number, u8 channel) {
     constexpr std::size_t BeaconFixedParametersSize = 12;
@@ -2375,6 +2394,29 @@ std::vector<u8> AddRadiotapHeader(std::span<const u8> frame, bool no_ack) {
                              current_channel, probe_request.size());
                 }
                 next_active_probe = now + ActiveProbeInterval;
+            }
+            // A hosted network stays on its own channel, as a retail host does. Hopping would put
+            // the beacons on channels 1, 6 and 11 in turn, each advertising a different channel.
+            if (latest_physical_beacon && !latest_physical_beacon->ack_shell_only) {
+                const u8 hosted_channel = BeaconDsChannel(latest_physical_beacon->body);
+                if (hosted_channel != 0 && hosted_channel != current_channel && !peer_is_recent &&
+                    !access_point_started && now >= next_channel_hop) {
+                    try {
+                        SetChannel(connection, generic_socket_id, port_id, family_id,
+                                   monitor_ifindex, ChannelToFrequency(hosted_channel), sequence);
+                        LOG_INFO(Service_NWM,
+                                 "UDS Real: hosting; tuned from channel {} to the network channel "
+                                 "{} and stopped hopping",
+                                 current_channel, hosted_channel);
+                        current_channel = hosted_channel;
+                    } catch (const std::exception& exception) {
+                        LOG_WARNING(Service_NWM,
+                                    "UDS Real: could not tune to hosted channel {}: {}",
+                                    hosted_channel, exception.what());
+                    }
+                    next_channel_hop = std::chrono::steady_clock::now() + DiscoveryChannelDwell;
+                }
+                continue;
             }
             if (now < next_channel_hop || beacon_is_recent || peer_is_recent ||
                 access_point_started) {
