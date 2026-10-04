@@ -2043,8 +2043,16 @@ std::vector<u8> AddRadiotapHeader(std::span<const u8> frame, bool no_ack) {
                         std::memcpy(radio_transmitter.data(),
                                     packet.data() + radiotap->length + 10, 6);
                         const bool radio_local = radio_transmitter == local_address;
+                        // While Azahar hosts, the peer is the joiner: its frames are addressed to our
+                        // MAC (address 1) instead of coming from a discovered retail beacon source.
+                        const bool radio_to_host =
+                            !radio_local && latest_physical_beacon &&
+                            !latest_physical_beacon->ack_shell_only &&
+                            std::memcmp(packet.data() + radiotap->length + 4, local_address.data(),
+                                        6) == 0;
                         const bool radio_retail =
-                            have_nintendo_source && radio_transmitter == nintendo_source;
+                            (have_nintendo_source && radio_transmitter == nintendo_source) ||
+                            radio_to_host;
                         if (radio_retail) {
                             // Capture completeness: the retail host numbers every frame it sends
                             // (beacons and data) consecutively, so a gap in what we captured is a
@@ -2052,24 +2060,58 @@ std::vector<u8> AddRadiotapHeader(std::span<const u8> frame, bool no_ack) {
                             static int last_seq = -1;
                             static std::size_t seen = 0;
                             static std::size_t missed = 0;
+                            static std::size_t retries = 0;
+                            static std::size_t dsss_frames = 0;  // 1, 2, 5.5 and 11 Mbit/s
+                            static std::size_t ofdm_frames = 0;  // 6 Mbit/s and up
+                            static int signal_sum = 0;
+                            static std::size_t signal_count = 0;
                             static auto window_start = std::chrono::steady_clock::now();
                             const int seq = ReadU16(packet.data() + radiotap->length + 22) >> 4;
-                            if (last_seq >= 0) {
+                            const bool seq_retry = (radio_frame_control & 0x0800) != 0;
+                            if (last_seq >= 0 && !seq_retry) {
                                 const int gap = (seq - last_seq) & 0xFFF;
                                 if (gap > 1 && gap < 64) {
                                     missed += static_cast<std::size_t>(gap - 1);
                                 }
                             }
-                            last_seq = seq;
+                            if (!seq_retry) {
+                                last_seq = seq;
+                            }
                             ++seen;
+                            if (seq_retry) {
+                                ++retries;
+                            }
+                            {
+                                const auto radio = DescribeRadiotapSignal(packet);
+                                if (radio.rate_500kbps) {
+                                    const u8 rate = *radio.rate_500kbps;
+                                    if (rate == 2 || rate == 4 || rate == 11 || rate == 22) {
+                                        ++dsss_frames;
+                                    } else {
+                                        ++ofdm_frames;
+                                    }
+                                }
+                                if (radio.signal_dbm) {
+                                    signal_sum += *radio.signal_dbm;
+                                    ++signal_count;
+                                }
+                            }
                             const auto now = std::chrono::steady_clock::now();
                             if (now - window_start >= std::chrono::seconds(3)) {
                                 LOG_INFO(Service_NWM,
                                          "UDS Real RADIO retail-capture: last 3s captured={}, "
-                                         "missedByGap={}",
-                                         seen, missed);
+                                         "missedByGap={}, retries={}, dsssFrames={}, ofdmFrames={}, "
+                                         "meanSignalDbm={}",
+                                         seen, missed, retries, dsss_frames, ofdm_frames,
+                                         signal_count ? signal_sum / static_cast<int>(signal_count)
+                                                      : 0);
                                 seen = 0;
                                 missed = 0;
+                                retries = 0;
+                                dsss_frames = 0;
+                                ofdm_frames = 0;
+                                signal_sum = 0;
+                                signal_count = 0;
                                 window_start = now;
                             }
                         }
