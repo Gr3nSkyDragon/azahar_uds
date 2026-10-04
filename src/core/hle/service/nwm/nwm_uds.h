@@ -542,6 +542,14 @@ private:
     void ClientKeepaliveCallback(std::uintptr_t user_data, s64 cycles_late);
     void MonitorLingerCallback(std::uintptr_t user_data, s64 cycles_late);
 
+    // Passive sniffer (environment variable AZAHAR_UDS_SNIFF=1): follows the retail UDS sessions that
+    // this emulator is not part of, derives each network's CCMP key from its beacon, decrypts the data
+    // frames of both consoles and logs them as "UDS SNIFF ..." lines. It never transmits.
+    void StartSniffMonitor();
+    void SniffObserveBeacon(const Network::WifiPacket& beacon);
+    void SniffHandleDataFrame(const UdsReal::CapturedFrame& frame);
+    void SniffLogUnprotectedFrame(const UdsReal::CapturedFrame& frame);
+
     /**
      * Returns a list of received 802.11 beacon frames from the specified sender since the last
      * call.
@@ -676,6 +684,9 @@ private:
     Core::TimingEventType* monitor_linger_event;
     std::uintptr_t monitor_linger_generation = 0;
 
+    // Starts the passive sniffer's monitor shortly after the service is created.
+    Core::TimingEventType* sniff_start_event = nullptr;
+
     // Event for handling async event signals
     Core::TimingEventType* handle_async_event_signals_event;
 
@@ -715,6 +726,22 @@ private:
     // Physical nl80211 monitor used by the experimental UDS Real backend.
     std::unique_ptr<UdsReal::Nl80211Monitor> real_monitor;
     std::optional<std::array<u8, 16>> physical_data_ccmp_key;
+
+    // Passive sniffer state (see StartSniffMonitor).
+    struct SniffNetwork {
+        std::array<u8, 16> key{};
+        u32 wlan_comm_id{};
+        u32 network_id{};
+        u8 id{};
+    };
+    bool sniff_enabled = false;
+    std::vector<u8> sniff_passphrase;
+    std::optional<u32> sniff_comm_id_filter;
+    std::mutex sniff_mutex;
+    std::map<Network::MacAddress, SniffNetwork> sniff_networks;
+    std::size_t sniff_frames_logged = 0;
+    std::size_t sniff_frames_without_key = 0;
+    std::size_t sniff_ccmp_failures = 0;
     // Nintendo SecureData has its own per-sender sequence, independent of the 802.11 sequence
     // control field and the CCMP packet number. Every host-originated SecureData packet shares
     // this counter so a retail peer does not discard later game packets as duplicates.

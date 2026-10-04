@@ -4,10 +4,12 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <map>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <boost/serialization/list.hpp>
 #include <boost/serialization/map.hpp>
@@ -1261,6 +1263,9 @@ void NWM_UDS::OnPhysicalFrameReceived(UdsReal::CapturedFrame frame) {
         packet.type = Network::WifiPacket::PacketType::Data;
         const bool protected_frame = (frame.frame_control & 0x4000) != 0;
         if (!protected_frame) {
+            if (sniff_enabled) {
+                SniffLogUnprotectedFrame(frame);
+            }
             packet.data = std::move(frame.body);
         } else {
             if (frame.body.size() < 16 || (frame.body[3] & 0x20) == 0) {
@@ -1274,6 +1279,10 @@ void NWM_UDS::OnPhysicalFrameReceived(UdsReal::CapturedFrame frame) {
                 ccmp_key = physical_data_ccmp_key;
             }
             if (!ccmp_key) {
+                if (sniff_enabled) {
+                    SniffHandleDataFrame(frame);
+                    return;
+                }
                 LOG_WARNING(Service_NWM,
                             "UDS Real: protected physical data received without a CCMP key");
                 return;
@@ -1439,6 +1448,9 @@ boost::optional<Network::MacAddress> NWM_UDS::GetNodeMacAddress(u16 dest_node_id
 
 void NWM_UDS::MonitorLingerCallback(std::uintptr_t user_data, [[maybe_unused]] s64 cycles_late) {
 #if UDS_REAL_BACKEND
+    if (sniff_enabled) {
+        return; // The passive sniffer needs the monitor for the whole emulation session.
+    }
     if (user_data != monitor_linger_generation || initialized) {
         return; // UDS was initialized again since this stop was scheduled.
     }
@@ -1449,6 +1461,212 @@ void NWM_UDS::MonitorLingerCallback(std::uintptr_t user_data, [[maybe_unused]] s
     }
 #endif
 }
+
+#if UDS_REAL_BACKEND
+namespace {
+
+std::string SniffMac(const std::array<u8, 6>& mac) {
+    return fmt::format("{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}", mac[0], mac[1], mac[2], mac[3],
+                       mac[4], mac[5]);
+}
+
+u32 SniffBigEndian32(const u8* p) {
+    return (static_cast<u32>(p[0]) << 24) | (static_cast<u32>(p[1]) << 16) |
+           (static_cast<u32>(p[2]) << 8) | static_cast<u32>(p[3]);
+}
+
+} // namespace
+
+void NWM_UDS::StartSniffMonitor() {
+    if (!real_monitor && UdsReal::IsPhysicalBackendEnabled()) {
+        real_monitor = std::make_unique<UdsReal::Nl80211Monitor>();
+    }
+    if (!real_monitor) {
+        LOG_WARNING(Service_NWM, "UDS SNIFF: no physical backend is available, sniffer not started");
+        return;
+    }
+    if (real_monitor->IsRunning()) {
+        return; // An Initialize() already started it with the same callbacks.
+    }
+    real_monitor->Start(
+        network_channel, GetMacAddress(),
+        [this](UdsReal::CapturedBeacon beacon) {
+            Network::WifiPacket packet{};
+            packet.type = Network::WifiPacket::PacketType::Beacon;
+            packet.data = std::move(beacon.frame);
+            packet.transmitter_address = beacon.transmitter_address;
+            packet.destination_address = beacon.destination_address;
+            packet.channel = beacon.channel;
+            if (sniff_enabled) {
+                SniffObserveBeacon(packet);
+            }
+            HandleBeaconFrame(packet);
+        },
+        [this](UdsReal::CapturedFrame frame) { OnPhysicalFrameReceived(std::move(frame)); });
+    LOG_INFO(Service_NWM,
+             "UDS SNIFF: passive monitor started, passphraseBytes={}, passphraseFingerprint=0x{:08X}, "
+             "commIdFilter={}",
+             sniff_passphrase.size(), FingerprintBytes(sniff_passphrase),
+             sniff_comm_id_filter ? fmt::format("0x{:08X}", *sniff_comm_id_filter) : "none");
+}
+
+void NWM_UDS::SniffObserveBeacon(const Network::WifiPacket& packet) {
+    // The beacon body starts with the 12-byte fixed parameters, then tagged elements. The Nintendo
+    // network info element (vendor tag 221, OUI 00:1F:32, type 21) holds the NetworkInfo structure
+    // from its OUI onward: comm id (big endian) at +4, id at +8, network id (big endian) at +12.
+    const auto& data = packet.data;
+    std::size_t pos = 12;
+    while (pos + 2 <= data.size()) {
+        const u8 tag = data[pos];
+        const u8 length = data[pos + 1];
+        pos += 2;
+        if (pos + length > data.size()) {
+            return;
+        }
+        if (tag == 221 && length >= 0x1F && data[pos] == 0x00 && data[pos + 1] == 0x1F &&
+            data[pos + 2] == 0x32 && data[pos + 3] == static_cast<u8>(NintendoTagId::NetworkInfo)) {
+            NetworkInfo info{};
+            info.host_mac_address = packet.transmitter_address;
+            info.wlan_comm_id = SniffBigEndian32(data.data() + pos + 4);
+            info.id = data[pos + 8];
+            info.network_id = SniffBigEndian32(data.data() + pos + 12);
+            const u32 comm_id = info.wlan_comm_id;
+            if (sniff_comm_id_filter && *sniff_comm_id_filter != comm_id) {
+                return;
+            }
+            SniffNetwork network;
+            network.wlan_comm_id = comm_id;
+            network.id = info.id;
+            network.network_id = static_cast<u32>(info.network_id);
+            network.key = GenerateDataCCMPKey(sniff_passphrase, info);
+            std::scoped_lock lock{sniff_mutex};
+            auto [it, inserted] = sniff_networks.try_emplace(packet.transmitter_address, network);
+            if (inserted || it->second.network_id != network.network_id ||
+                it->second.wlan_comm_id != network.wlan_comm_id) {
+                it->second = network;
+                LOG_INFO(Service_NWM,
+                         "UDS SNIFF: network {} host={}, channel={}, wlanCommId=0x{:08X}, id={}, "
+                         "networkId=0x{:08X}, totalNodes={}, maxNodes={}",
+                         inserted ? "found" : "changed", SniffMac(packet.transmitter_address),
+                         packet.channel, comm_id, network.id, network.network_id,
+                         data[pos + 16], data[pos + 17]);
+            }
+            return;
+        }
+        pos += length;
+    }
+}
+
+void NWM_UDS::SniffLogUnprotectedFrame(const UdsReal::CapturedFrame& frame) {
+    {
+        std::scoped_lock lock{sniff_mutex};
+        if (sniff_networks.find(frame.bssid) == sniff_networks.end()) {
+            return;
+        }
+    }
+    LOG_INFO(Service_NWM,
+             "UDS SNIFF UNPROTECTED: bssid={}, transmitter={}, destination={}, role={}, "
+             "dot11Sequence={}, bodyBytes={}, bodyFingerprint=0x{:08X}, body={}",
+             SniffMac(frame.bssid), SniffMac(frame.transmitter_address),
+             SniffMac(frame.destination_address),
+             frame.transmitter_address == frame.bssid ? "host" : "client",
+             frame.sequence_control >> 4, frame.body.size(), FingerprintBytes(frame.body),
+             FormatHexBytes(frame.body));
+}
+
+void NWM_UDS::SniffHandleDataFrame(const UdsReal::CapturedFrame& frame) {
+    if (frame.body.size() < 16 || (frame.body[3] & 0x20) == 0) {
+        return;
+    }
+    std::array<u8, 16> key{};
+    {
+        std::scoped_lock lock{sniff_mutex};
+        const auto network = sniff_networks.find(frame.bssid);
+        if (network == sniff_networks.end()) {
+            ++sniff_frames_without_key;
+            if (sniff_frames_without_key <= 10 || sniff_frames_without_key % 200 == 0) {
+                LOG_INFO(Service_NWM,
+                         "UDS SNIFF: protected frame from bssid={} but no beacon seen for it "
+                         "(count={})",
+                         SniffMac(frame.bssid), sniff_frames_without_key);
+            }
+            return;
+        }
+        key = network->second.key;
+    }
+
+    const u64 packet_number = ReadCCMPPacketNumber(std::span<const u8>{frame.body.data(), std::size_t{8}});
+    auto decrypted = DecryptDataFrame(std::span<const u8>{frame.body.data() + 8, frame.body.size() - 8},
+                                      key, frame.transmitter_address, frame.destination_address,
+                                      frame.bssid, packet_number, frame.frame_control,
+                                      frame.sequence_control);
+    if (!decrypted) {
+        ++sniff_ccmp_failures;
+        if (sniff_ccmp_failures <= 20 || sniff_ccmp_failures % 100 == 0) {
+            LOG_INFO(Service_NWM,
+                     "UDS SNIFF: CCMP check failed #{} bssid={}, transmitter={}, packetNumber={}, "
+                     "bodyBytes={}",
+                     sniff_ccmp_failures, SniffMac(frame.bssid),
+                     SniffMac(frame.transmitter_address), packet_number, frame.body.size());
+        }
+        return;
+    }
+
+    const std::vector<u8>& plain = *decrypted;
+    const bool retry = (frame.frame_control & 0x0800) != 0;
+    const char* role = frame.transmitter_address == frame.bssid ? "host" : "client";
+    if (plain.size() < sizeof(LLCHeader) || plain[0] != 0xAA || plain[1] != 0xAA ||
+        plain[2] != 0x03) {
+        return;
+    }
+    if (GetFrameEtherType(plain) != EtherType::SecureData) {
+        LOG_INFO(Service_NWM,
+                 "UDS SNIFF OTHER: bssid={}, transmitter={}, role={}, dot11Sequence={}, "
+                 "ccmpPN={}, plaintextBytes={}, plaintext={}",
+                 SniffMac(frame.bssid), SniffMac(frame.transmitter_address), role,
+                 frame.sequence_control >> 4, packet_number, plain.size(), FormatHexBytes(plain));
+        return;
+    }
+    if (plain.size() < sizeof(LLCHeader) + 4) {
+        return;
+    }
+
+    // Container header (protocol size, packet count), then packet_count sub-packets that each start
+    // with their own size (which counts itself): management flag, channel, sequence, destination
+    // node, source node, payload.
+    const auto container = ParseSecureDataHeader(plain);
+    const std::size_t end = std::min<std::size_t>(plain.size(), sizeof(LLCHeader) + container.protocol_size);
+    const u16 count = container.packet_count;
+    std::size_t offset = sizeof(LLCHeader) + 4;
+    for (u16 index = 0; index < count && offset + 2 <= end; ++index) {
+        const std::size_t size = (static_cast<std::size_t>(plain[offset]) << 8) | plain[offset + 1];
+        if (size < 10 || offset + size > end) {
+            LOG_INFO(Service_NWM,
+                     "UDS SNIFF: malformed sub-packet index={}/{} size={} remaining={}", index + 1,
+                     count, size, end - offset);
+            break;
+        }
+        const u8 management = plain[offset + 2];
+        const u8 channel = plain[offset + 3];
+        const u16 sequence = static_cast<u16>((plain[offset + 4] << 8) | plain[offset + 5]);
+        const u16 destination_node = static_cast<u16>((plain[offset + 6] << 8) | plain[offset + 7]);
+        const u16 source_node = static_cast<u16>((plain[offset + 8] << 8) | plain[offset + 9]);
+        const std::span<const u8> payload{plain.data() + offset + 10, size - 10};
+        ++sniff_frames_logged;
+        LOG_INFO(Service_NWM,
+                 "UDS SNIFF DATA: bssid={}, transmitter={}, destination={}, role={}, channel={}, "
+                 "management={}, secureSequence={}, sourceNode={}, destinationNode={}, "
+                 "dot11Sequence={}, retry={}, ccmpPN={}, subPacket={}/{}, payloadBytes={}, "
+                 "payloadFingerprint=0x{:08X}, payload={}",
+                 SniffMac(frame.bssid), SniffMac(frame.transmitter_address),
+                 SniffMac(frame.destination_address), role, channel, management, sequence,
+                 source_node, destination_node, frame.sequence_control >> 4, retry, packet_number,
+                 index + 1, count, payload.size(), FingerprintBytes(payload),
+                 FormatHexBytes(payload));
+        offset += size;
+    }
+}
+#endif
 
 void NWM_UDS::ShutdownHLE() {
 #if UDS_REAL_BACKEND
@@ -1664,6 +1882,9 @@ ResultVal<std::shared_ptr<Kernel::Event>> NWM_UDS::Initialize(
                 packet.transmitter_address = beacon.transmitter_address;
                 packet.destination_address = beacon.destination_address;
                 packet.channel = beacon.channel;
+                if (sniff_enabled) {
+                    SniffObserveBeacon(packet);
+                }
                 HandleBeaconFrame(packet);
             },
             [this](UdsReal::CapturedFrame frame) {
@@ -3015,6 +3236,33 @@ NWM_UDS::NWM_UDS(Core::System& system) : ServiceFramework("nwm::UDS"), system(sy
         "UDS::MonitorLingerCallback", [this](std::uintptr_t user_data, s64 cycles_late) {
             MonitorLingerCallback(user_data, cycles_late);
         });
+
+#if UDS_REAL_BACKEND
+    sniff_start_event = system.CoreTiming().RegisterEvent(
+        "UDS::SniffStartCallback",
+        [this]([[maybe_unused]] std::uintptr_t user_data, [[maybe_unused]] s64 cycles_late) {
+            StartSniffMonitor();
+        });
+    {
+        const char* sniff = std::getenv("AZAHAR_UDS_SNIFF");
+        sniff_enabled = sniff && *sniff && std::string_view{sniff} != "0";
+        if (sniff_enabled) {
+            const char* phrase = std::getenv("AZAHAR_UDS_SNIFF_PASSPHRASE");
+            if (phrase && *phrase) {
+                sniff_passphrase.assign(phrase, phrase + std::strlen(phrase));
+            } else {
+                // The Game Boy Virtual Console titles pass "TRL_NETWORK" plus a terminating NUL to
+                // ConnectToNetwork (12 bytes); that is the input of the public CCMP key derivation.
+                const std::string_view default_phrase{"TRL_NETWORK\0", 12};
+                sniff_passphrase.assign(default_phrase.begin(), default_phrase.end());
+            }
+            if (const char* comm = std::getenv("AZAHAR_UDS_SNIFF_COMMID"); comm && *comm) {
+                sniff_comm_id_filter = static_cast<u32>(std::strtoul(comm, nullptr, 0));
+            }
+            system.CoreTiming().ScheduleEvent(msToCycles(1000), sniff_start_event, 0);
+        }
+    }
+#endif
 
     handle_async_event_signals_event = system.CoreTiming().RegisterEvent(
         "UDS::handle_async_event_signals_event",
