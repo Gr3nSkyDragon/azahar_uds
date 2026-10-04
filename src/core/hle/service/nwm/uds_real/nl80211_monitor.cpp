@@ -2043,13 +2043,22 @@ std::vector<u8> AddRadiotapHeader(std::span<const u8> frame, bool no_ack) {
                         std::memcpy(radio_transmitter.data(),
                                     packet.data() + radiotap->length + 10, 6);
                         const bool radio_local = radio_transmitter == local_address;
-                        // While Azahar hosts, the peer is the joiner: its frames are addressed to our
-                        // MAC (address 1) instead of coming from a discovered retail beacon source.
-                        const bool radio_to_host =
-                            !radio_local && latest_physical_beacon &&
+                        // While Azahar hosts, the peer is the joiner: its frames carry our MAC as the
+                        // BSSID. UDS data frames use the ad-hoc layout (BSSID in address 3), joins use
+                        // address 1 or 2 depending on the DS bits.
+                        bool radio_to_host = false;
+                        if (!radio_local && latest_physical_beacon &&
                             !latest_physical_beacon->ack_shell_only &&
-                            std::memcmp(packet.data() + radiotap->length + 4, local_address.data(),
-                                        6) == 0;
+                            packet.size() >= radiotap->length + 24) {
+                            const bool to_ds = (radio_frame_control & 0x0100) != 0;
+                            const bool from_ds = (radio_frame_control & 0x0200) != 0;
+                            const std::size_t bssid_offset =
+                                (!to_ds && !from_ds) ? 16 : (to_ds && !from_ds) ? 4 : 10;
+                            radio_to_host = !(to_ds && from_ds) &&
+                                            std::memcmp(packet.data() + radiotap->length +
+                                                            bssid_offset,
+                                                        local_address.data(), 6) == 0;
+                        }
                         const bool radio_retail =
                             (have_nintendo_source && radio_transmitter == nintendo_source) ||
                             radio_to_host;
