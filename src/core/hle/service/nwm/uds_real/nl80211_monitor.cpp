@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <iterator>
@@ -931,6 +932,36 @@ RadiotapSignal DescribeRadiotapSignal(const std::vector<u8>& packet) {
 // data on the air too long, and 54 Mbps got no replies from the retail host.
 constexpr u8 ClientDataTxRate500kbps = 22;
 
+// Transmit rate for game data frames the host sends (FromDS data). A retail host sends them at
+// 24 Mbps OFDM (302 of 303 data frames in the passive capture of a 3DS XL hosting VC Red); the
+// injection default of 1 Mbps keeps a 25-unit window (about 1.4 KB) on the air for 12 ms instead of
+// 0.5 ms and the retail joiner lost or delayed many of them. Set AZAHAR_UDS_HOST_RATE to a rate in
+// 500 kbps units (22 = 11 Mbps, 48 = 24 Mbps, 0 = driver default) to experiment without a rebuild.
+constexpr u8 HostDataTxRate500kbps = 48;
+
+u8 HostDataTxRate() {
+    static const u8 rate = [] {
+        if (const char* value = std::getenv("AZAHAR_UDS_HOST_RATE")) {
+            return static_cast<u8>(std::strtoul(value, nullptr, 10));
+        }
+        return HostDataTxRate500kbps;
+    }();
+    return rate;
+}
+
+// Fixed transmit rate for an outgoing frame in 500 kbps units, or 0 for the driver/firmware default.
+// Only data frames are touched; management frames keep the default rate.
+u8 DataTxRate500kbps(std::span<const u8> frame) {
+    if (frame.size() < 2) {
+        return 0;
+    }
+    const u16 frame_control = ReadU16(frame.data());
+    if (((frame_control >> 2) & 0x3) != 2) {
+        return 0;
+    }
+    return (frame_control & 0x0200) != 0 ? HostDataTxRate() : ClientDataTxRate500kbps;
+}
+
 std::optional<RadiotapInfo> ParseRadiotap(const std::vector<u8>& packet) {
     if (packet.size() < 8 || packet[0] != 0 || packet[1] != 0) {
         return std::nullopt;
@@ -1301,16 +1332,10 @@ std::vector<u8> AddRadiotapHeader(std::span<const u8> frame, bool no_ack) {
     constexpr u32 RadiotapPresentTxFlags = 1U << 15;
     constexpr u16 RadiotapTxNoAck = 0x0008;
 
-    // Optional experiment: fixed rate for data frames a client originates (NoDS/ToDS). Frames a
-    // host sends (FromDS) and all management frames keep the driver's default rate.
+    // Fixed rates for data frames (see DataTxRate500kbps); management frames keep the default.
     std::optional<u8> rate;
-    if (frame.size() >= 2) {
-        const u16 frame_control = ReadU16(frame.data());
-        const bool is_data = ((frame_control >> 2) & 0x3) == 2;
-        const bool from_ds = (frame_control & 0x0200) != 0;
-        if (is_data && !from_ds) {
-            rate = ClientDataTxRate500kbps;
-        }
+    if (const u8 data_rate = DataTxRate500kbps(frame); data_rate != 0) {
+        rate = data_rate;
     }
 
     u32 present = 0;
@@ -2886,17 +2911,9 @@ void RunEsp32Body(std::atomic<bool>& stop_requested, std::atomic<u16>& selected_
             std::vector<u8> payload;
             payload.reserve(2 + pending_frame->size());
             u8 flags = 0;
-            u8 rate = 0;
+            const u8 rate = DataTxRate500kbps(*pending_frame);
             if (IsGroupAddressedFrame(*pending_frame)) {
                 flags |= Esp32::TxNoAck;
-            }
-            if (pending_frame->size() >= 2) {
-                const u16 frame_control = ReadU16(pending_frame->data());
-                const bool is_data = ((frame_control >> 2) & 0x3) == 2;
-                const bool from_ds = (frame_control & 0x0200) != 0;
-                if (is_data && !from_ds) {
-                    rate = ClientDataTxRate500kbps;
-                }
             }
             payload.push_back(flags);
             payload.push_back(rate);
