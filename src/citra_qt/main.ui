@@ -192,6 +192,7 @@
     <addaction name="action_View_Lobby"/>
     <addaction name="action_Start_Room"/>
     <addaction name="action_Connect_To_Room"/>
+    <addaction name="action_Local_mGBA_VC"/>
     <addaction name="separator"/>
     <addaction name="action_Show_Room"/>
     <addaction name="action_Leave_Room"/>
@@ -559,6 +560,17 @@
   <action name="action_Connect_To_Room">
    <property name="text">
     <string>Direct Connect to Room</string>
+   </property>
+  </action>
+  <action name="action_Local_mGBA_VC">
+   <property name="checkable">
+    <bool>true</bool>
+   </property>
+   <property name="text">
+    <string>Local mGBA Virtual Console</string>
+   </property>
+   <property name="toolTip">
+    <string>Connect a Game Boy Virtual Console game to mGBA running on this computer. Takes effect the next time a game starts.</string>
    </property>
   </action>
   <action name="action_Show_Room">

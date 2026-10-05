@@ -9,6 +9,7 @@
 #include <vector>
 #include <boost/asio.hpp>
 #include "common/logging/log.h"
+#include "common/settings.h"
 #include "core/hle/service/nwm/uds_bridge.h"
 
 namespace Service::NWM {
@@ -146,15 +147,21 @@ private:
     std::atomic<std::size_t> received{0};
 };
 
-std::unique_ptr<UdsBridge> UdsBridge::CreateFromEnvironment(
+std::unique_ptr<UdsBridge> UdsBridge::CreateFromConfiguration(
     std::function<void(const Network::WifiPacket&)> on_packet) {
+    // The environment variable, when set, wins (it can also move the ports); otherwise the menu setting.
+    unsigned long port = DefaultListenPort;
     const char* value = std::getenv("AZAHAR_UDS_BRIDGE");
-    if (!value || !*value || std::string_view{value} == "0") {
+    if (value && *value) {
+        if (std::string_view{value} == "0") {
+            return nullptr;
+        }
+        port = std::strtoul(value, nullptr, 0);
+        if (port <= 1 || port >= 65535) {
+            port = DefaultListenPort;
+        }
+    } else if (!Settings::values.use_mgba_vc_bridge.GetValue()) {
         return nullptr;
-    }
-    unsigned long port = std::strtoul(value, nullptr, 0);
-    if (port <= 1 || port >= 65535) {
-        port = DefaultListenPort;
     }
     return std::make_unique<UdsBridge>(static_cast<u16>(port), static_cast<u16>(port + 1),
                                        std::move(on_packet));

@@ -3286,7 +3286,7 @@ NWM_UDS::NWM_UDS(Core::System& system) : ServiceFramework("nwm::UDS"), system(sy
         LOG_ERROR(Service_NWM, "Network isn't initalized");
     }
 
-    bridge = UdsBridge::CreateFromEnvironment(
+    bridge = UdsBridge::CreateFromConfiguration(
         [this](const Network::WifiPacket& packet) { OnWifiPacketReceived(packet); });
 }
 

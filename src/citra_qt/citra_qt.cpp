@@ -1164,6 +1164,15 @@ void GMainWindow::ConnectMenuEvents() {
             &MultiplayerState::OnDirectConnectToRoom);
     connect(ui->action_Show_Room, &QAction::triggered, multiplayer_state,
             &MultiplayerState::OnOpenNetworkRoom);
+    ui->action_Local_mGBA_VC->setChecked(Settings::values.use_mgba_vc_bridge.GetValue());
+    connect(ui->action_Local_mGBA_VC, &QAction::toggled, this, [this](bool checked) {
+        Settings::values.use_mgba_vc_bridge = checked;
+        // The bridge is opened by the network service when a game starts.
+        statusBar()->showMessage(
+            checked ? tr("Local mGBA Virtual Console on: takes effect the next time a game starts")
+                    : tr("Local mGBA Virtual Console off: takes effect the next time a game starts"),
+            5000);
+    });
 
     connect_menu(ui->action_Fullscreen, &GMainWindow::ToggleFullscreen);
     connect_menu(ui->action_Screen_Layout_Default, &GMainWindow::ChangeScreenLayout);

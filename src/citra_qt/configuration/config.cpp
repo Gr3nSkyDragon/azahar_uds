@@ -926,6 +926,7 @@ void QtConfig::ReadWebServiceValues() {
     ReadBasicSetting(Settings::values.web_api_url);
     ReadBasicSetting(Settings::values.network_token);
     ReadBasicSetting(Settings::values.use_esp32_uds);
+    ReadBasicSetting(Settings::values.use_mgba_vc_bridge);
 
     qt_config->endGroup();
 }
@@ -1461,6 +1462,7 @@ void QtConfig::SaveWebServiceValues() {
     WriteBasicSetting(Settings::values.web_api_url);
     WriteBasicSetting(Settings::values.network_token);
     WriteBasicSetting(Settings::values.use_esp32_uds);
+    WriteBasicSetting(Settings::values.use_mgba_vc_bridge);
 
     qt_config->endGroup();
 }

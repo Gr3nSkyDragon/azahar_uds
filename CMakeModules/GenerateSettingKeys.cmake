@@ -11,6 +11,7 @@ foreach(KEY IN ITEMS
     "use_cpu_jit"
     "use_fastinterp"
     "use_esp32_uds"
+    "use_mgba_vc_bridge"
     "cpu_clock_percentage"
     "is_new_3ds"
     "lle_applets"

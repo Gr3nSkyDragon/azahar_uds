@@ -487,6 +487,8 @@ struct Values {
     Setting<bool> use_fastinterp{true, Keys::use_fastinterp};
     // Android only: bridge UDS local wireless to a real radio through an ESP32-S3 over USB.
     Setting<bool> use_esp32_uds{false, Keys::use_esp32_uds};
+    // Desktop: carry UDS local wireless over a localhost UDP link to the mGBA Virtual Console wrapper (read when a game starts).
+    Setting<bool> use_mgba_vc_bridge{false, Keys::use_mgba_vc_bridge};
     SwitchableSetting<s32, true> cpu_clock_percentage{100, 5, 400, Keys::cpu_clock_percentage};
     SwitchableSetting<bool> is_new_3ds{true, Keys::is_new_3ds};
     SwitchableSetting<bool> lle_applets{true, Keys::lle_applets};

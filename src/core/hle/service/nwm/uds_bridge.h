@@ -17,8 +17,11 @@ namespace Service::NWM {
 /// OnWifiPacketReceived accepts, so a joiner on the other end sees a hosted network without any
 /// 802.11 or CCMP work.
 ///
-/// Enabled by the environment variable AZAHAR_UDS_BRIDGE: "1" selects the default ports, a number
-/// N makes Azahar listen on N and send to N + 1 (the other program does the reverse).
+/// Enabled by the "Local mGBA Virtual Console" entry of the Multiplayer menu (the use_mgba_vc_bridge
+/// setting), which selects the default ports, or by the environment variable AZAHAR_UDS_BRIDGE, which
+/// takes precedence: "1" selects the default ports, a number N makes Azahar listen on N and send to
+/// N + 1 (the other program does the reverse; mGBA's default is the same pair). Either is read when a
+/// game starts.
 ///
 /// One datagram is one packet:
 ///   0..3   'U' 'D' 'S' 'B'
@@ -34,8 +37,9 @@ public:
     static constexpr u16 DefaultListenPort = 45710;
     static constexpr std::size_t HeaderSize = 20;
 
-    /// Returns a bridge when AZAHAR_UDS_BRIDGE asks for one, else nullptr.
-    static std::unique_ptr<UdsBridge> CreateFromEnvironment(
+    /// Returns a bridge when AZAHAR_UDS_BRIDGE or the use_mgba_vc_bridge setting asks for one, else
+    /// nullptr.
+    static std::unique_ptr<UdsBridge> CreateFromConfiguration(
         std::function<void(const Network::WifiPacket&)> on_packet);
 
     UdsBridge(u16 listen_port, u16 send_port,
