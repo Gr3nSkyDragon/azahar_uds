@@ -31,6 +31,14 @@
 #define UDS_CMD_SET_BEACON 0x07 /* {mpdu...}, empty clears */
 #define UDS_CMD_SET_WATCH 0x08  /* {mac[6]}, all zero clears */
 #define UDS_CMD_PING 0x09       /* {token:u32} */
+/* The key the Game Boy wrapper needs, kept on the board (keys.h). Never sent back. */
+#define UDS_CMD_SET_KEY 0x0A    /* {slot:u8 (0x2D), key[16]} */
+#define UDS_CMD_KEY_STATUS 0x0B /* {} -> KEY_INFO */
+#define UDS_CMD_ERASE_KEYS 0x0C /* {} */
+/* The Game Boy wrapper mode (gbwrap.h). Azahar never sends these; the raw radio commands above are refused while it runs. */
+#define UDS_CMD_GB_START 0x10   /* {flags:u8 (bit 0: log), title[16] (cartridge header, 0x134), name[20] (UTF-16LE)} */
+#define UDS_CMD_GB_XFER 0x11    /* {master:u8}: the cartridge clocked a transfer out -> GB_REPLY */
+#define UDS_CMD_GB_STOP 0x12    /* {} */
 
 /* Device -> host. */
 #define UDS_EVT_HELLO_ACK 0x81 /* {proto:u8, fw_major:u8, fw_minor:u8, factory_mac[6]} */
@@ -40,6 +48,11 @@
 #define UDS_EVT_STATS 0x85     /* 9 x u32 LE: see uds_stats_t in radio.h */
 #define UDS_EVT_PONG 0x86      /* {token:u32} */
 #define UDS_EVT_TXDONE 0x87    /* {acked:u8, length:u16 LE, first bytes of the frame sent} */
+#define UDS_EVT_KEY_INFO 0x88  /* {slot:u8, present:u8} */
+#define UDS_EVT_GB_STATE 0x90  /* {room:u8, session:u8 (0xFF none), wire phase:u8, generation:u8, channel:u8}, on change */
+#define UDS_EVT_GB_REPLY 0x91  /* {slave:u8, wire phase:u8}, echoes the GB_XFER seq */
+#define UDS_EVT_GB_STATS 0x92  /* 10 x u32 LE: beacons, frames sent, frames received, dropped (decrypt, replay, other), tx failed,
+                                  units sent, units received, transfers; every 5 s */
 
 #define UDS_TX_NO_ACK 0x01
 #define UDS_RX_TRUNCATED 0x01

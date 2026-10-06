@@ -95,6 +95,32 @@ Host to device:
 | `0x08` SET_WATCH | `mac[6]`; all zero clears | STATUS |
 | `0x09` PING | `token:u32` | PONG |
 
+Firmware 1.4 adds a second job, the **Game Boy wrapper** (`main/gbwrap.c`, see `main/gbwrap/README.md`): the board itself joins a
+3DS running a Virtual Console Pokemon game (Red, Blue, Yellow, Gold, Silver, Crystal) and stands in for a link-cable partner, so the
+host only carries a cartridge's serial transfers. Azahar never sends these commands and keeps the raw radio above; while the wrapper
+runs, the raw radio commands are refused (`ESP_ERR_INVALID_STATE`) and received frames stay on the board.
+
+| Type | Payload | Reply |
+| --- | --- | --- |
+| `0x0A` SET_KEY | `slot:u8 (0x2D), key[16]` | STATUS. Stored in flash (NVS), survives reflashing, never sent back |
+| `0x0B` KEY_STATUS | none | `0x88` KEY_INFO `{slot, present}` |
+| `0x0C` ERASE_KEYS | none | STATUS |
+| `0x10` GB_START | `flags:u8 (bit 0: log), title[16] (cartridge header at 0x134), name[20] (UTF-16LE)` | STATUS: 0, `0x105` no key stored, `0x106` unknown game |
+| `0x11` GB_XFER | `master:u8`, the byte the cartridge clocked out | `0x91` GB_REPLY `{slave:u8, wire phase:u8}`, the byte shifted back in the same transfer |
+| `0x12` GB_STOP | none | STATUS (STOP does the same while the wrapper runs) |
+
+While the wrapper runs the board also sends `0x90` GB_STATE `{room, session, wire phase, generation, channel}` on every change,
+`0x92` GB_STATS (10 × u32: beacons, frames sent and received, frames dropped for decryption, replay and other reasons, tx failures,
+units sent and received, transfers) every 5 s, and, with the log flag, LOG lines. The key is the 3DS UDS data key, AES key slot `0x2D`
+KeyN (the line `slot0x2DKeyN=` of Azahar's `aes_keys.txt`). mGBA stores it from its key file the first time it needs it, or by hand:
+mGBA's probe tool (in mGBA's build folder; in PowerShell the quoted path needs `&` in front):
+
+```
+& "<mGBA build folder>\uds-esp32-probe.exe" COMx --store-key "<path>\aes_keys.txt"
+```
+
+and `--key-status` or `--erase-keys` in place of `--store-key <file>`.
+
 Device to host: `0x81` HELLO_ACK `{proto, fw_major, fw_minor, factory_mac[6]}`, `0x82` STATUS
 `{request_type:u8, result:s32}` (echoes the request's `seq`), `0x83` RX `{channel, rssi, flags, mpdu}`,
 `0x85` STATS every 5 s (`rx_seen, rx_forwarded, rx_dropped, tx_ok, tx_failed, beacons_sent,

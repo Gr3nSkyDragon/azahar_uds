@@ -14,11 +14,13 @@
 #include "freertos/ringbuf.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "gbwrap.h"
+#include "keys.h"
 #include "radio.h"
 #include "uds_wire.h"
 
 #define FW_MAJOR 1
-#define FW_MINOR 3
+#define FW_MINOR 4
 #define PROTOCOL_VERSION UDS_WIRE_VERSION
 #define RX_RING_BYTES (48 * 1024)
 #define STATS_INTERVAL_US (5 * 1000 * 1000)
@@ -55,9 +57,18 @@ static void send_status(uint8_t request_type, uint8_t seq, int32_t result)
     send_frame(UDS_EVT_STATUS, seq, 0, payload, sizeof(payload));
 }
 
-/* Called from the Wi-Fi task: queue only. Ring items are {event type, payload...}. */
+static void gbwrap_send(uint8_t type, uint8_t seq, const uint8_t *payload, size_t length)
+{
+    send_frame(type, seq, 0, payload, length);
+}
+
+/* Called from the Wi-Fi task: queue only. Ring items are {event type, payload...}. While the Game Boy wrapper runs, the frames are
+ * its own and do not go to the host. */
 static bool event_sink(uint8_t type, const uint8_t *payload, size_t length)
 {
+    if (gbwrap_active()) {
+        return type == UDS_EVT_RX ? gbwrap_sink_rx(payload, length) : true;
+    }
     static uint8_t item[1 + UDS_WIRE_MAX_PAYLOAD];
     if (length > UDS_WIRE_MAX_PAYLOAD) return false;
     item[0] = type;
@@ -95,11 +106,51 @@ static void stats_task(void *arg)
     }
 }
 
-static void handle_command(const uds_wire_frame_t *frame)
+static void handle_command(uds_wire_frame_t *frame)
 {
     const uint8_t *p = frame->payload;
     const size_t n = frame->length;
     esp_err_t result = ESP_OK;
+
+    switch (frame->type) {
+    case UDS_CMD_GB_START:
+    case UDS_CMD_GB_XFER:
+    case UDS_CMD_GB_STOP:
+        gbwrap_request(frame->type, frame->seq, p, n); /* the wrapper task answers */
+        return;
+    case UDS_CMD_SET_KEY:
+        result = n == 17 ? keys_store(p[0], p + 1) : ESP_ERR_INVALID_SIZE;
+        memset((uint8_t *)frame->payload, 0, n); /* the key is not kept anywhere but in the key store (the payload is the decoder's) */
+        send_status(frame->type, frame->seq, (int32_t)result);
+        return;
+    case UDS_CMD_KEY_STATUS: {
+        uint8_t payload[2] = {UDS_KEY_SLOT_DATA, keys_present(UDS_KEY_SLOT_DATA)};
+        send_frame(UDS_EVT_KEY_INFO, frame->seq, 0, payload, sizeof(payload));
+        return;
+    }
+    case UDS_CMD_ERASE_KEYS:
+        send_status(frame->type, frame->seq, (int32_t)keys_erase());
+        return;
+    case UDS_CMD_STOP:
+        if (gbwrap_active()) {
+            gbwrap_request(frame->type, frame->seq, p, n);
+            return;
+        }
+        break; /* the radio's own STOP, below */
+    case UDS_CMD_START:
+    case UDS_CMD_SET_CHANNEL:
+    case UDS_CMD_TX_FRAME:
+    case UDS_CMD_SET_BEACON:
+    case UDS_CMD_SET_WATCH:
+        if (gbwrap_active()) {
+            /* The radio belongs to the Game Boy wrapper until GB_STOP. */
+            if (frame->type != UDS_CMD_TX_FRAME) send_status(frame->type, frame->seq, ESP_ERR_INVALID_STATE);
+            return;
+        }
+        break;
+    default:
+        break;
+    }
 
     switch (frame->type) {
     case UDS_CMD_HELLO: {
@@ -156,7 +207,9 @@ void app_main(void)
     const uint8_t delimiter = 0;
     usb_serial_jtag_write_bytes(&delimiter, 1, pdMS_TO_TICKS(50));
 
+    keys_init();
     radio_init(event_sink);
+    gbwrap_init(gbwrap_send);
 
     xTaskCreate(rx_forward_task, "rx_fwd", 4096, NULL, 6, NULL);
     xTaskCreate(stats_task, "stats", 3072, NULL, 2, NULL);
