@@ -27,8 +27,16 @@ adapter). The board is powered from the phone; 2.4 GHz radio TX draws a few hund
 ## Flashing a pre-built firmware (no ESP-IDF needed)
 
 Each release ships one file, `esp32-uds-bridge-fw<version>-esp32s3.bin` (bootloader, partition table
-and app merged). It is written at **offset `0x0`**. Plug the board in through its **native USB port**
-(the one that shows up as an Espressif USB Serial/JTAG device) and use either of these:
+and app merged). It is written at **offset `0x0`**, gaps included, so it also **erases the stored 3DS key**:
+store the key again after flashing. Plug the board in through its **native USB port** (the one that
+shows up as an Espressif USB Serial/JTAG device) and use one of these:
+
+**With uds-esp32-setup (Windows).** `uds-esp32-setup.exe` ships next to the `.bin`. It
+flashes the firmware and then stores the 3DS key from your `aes_keys.txt` in one go (either step can
+be done on its own): pick the firmware (the newest `.bin` beside it is filled in), your `aes_keys.txt`
+and the board, and press Start. Only the one 16-byte key the board needs (slot 0x2D) is sent to it,
+and it is never shown or logged. It is built from mGBA-LDN's sources (`src/gb/sio/uds-esp32-setup.c`,
+target `uds-esp32-setup`) and needs nothing else installed.
 
 **In the browser (nothing to install).** Open Espressif's [esptool-js](https://espressif.github.io/esptool-js/)
 in Chrome or Edge (it needs Web Serial). Connect, pick the board's port, add the `.bin` at address
@@ -38,7 +46,7 @@ in Chrome or Edge (it needs Web Serial). Connect, pick the board's port, add the
 
 ```
 pip install esptool
-esptool --chip esp32s3 -p COM4 write_flash 0x0 esp32-uds-bridge-fw1.3-esp32s3.bin
+esptool --chip esp32s3 -p COM4 write_flash 0x0 esp32-uds-bridge-fw1.4-esp32s3.bin
 ```
 
 (replace `COM4` with the board's port; on older esptool versions the command is `esptool.py`).
@@ -102,7 +110,7 @@ runs, the raw radio commands are refused (`ESP_ERR_INVALID_STATE`) and received 
 
 | Type | Payload | Reply |
 | --- | --- | --- |
-| `0x0A` SET_KEY | `slot:u8 (0x2D), key[16]` | STATUS. Stored in flash (NVS), survives reflashing, never sent back |
+| `0x0A` SET_KEY | `slot:u8 (0x2D), key[16]` | STATUS. Stored in flash (NVS), never sent back. `idf.py flash` leaves it; a release image written at 0x0 erases it |
 | `0x0B` KEY_STATUS | none | `0x88` KEY_INFO `{slot, present}` |
 | `0x0C` ERASE_KEYS | none | STATUS |
 | `0x10` GB_START | `flags:u8 (bit 0: log), title[16] (cartridge header at 0x134), name[20] (UTF-16LE)` | STATUS: 0, `0x105` no key stored, `0x106` unknown game |
