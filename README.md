@@ -54,6 +54,7 @@ If you have an SSD1306, SSD1315, or SSD1309 screen, you can connect them to the 
 | Other C3 boards (e.g. SuperMini) | GPIO6 | GPIO7 | 3V3 | GND |
 
 ### Android 
+
 On Android the radio is an **ESP32-S3 connected to the phone by USB-C** instead of a USB Wi-Fi adapter and ldnd.exe. Flash the board with [firmware/esp32-uds-bridge](firmware/esp32-uds-bridge/README.md), plug it into the phone's USB-C port, then turn on **Settings > Network > ESP32 local wireless** and start the game. Android asks for USB permission for the board the first time. 
 ---
 
