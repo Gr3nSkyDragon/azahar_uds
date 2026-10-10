@@ -7,23 +7,59 @@ This fork and its primary unique feature(s) were coded using LLM generated mater
 # How to run
 
 ### Prerequisites
-If you don't have an ESP32-S3, you'll need to set up ldnd.exe from [unlimitedcoder2](https://gist.github.com/unlimitedcoder2/af2f09694563c6a6cd3d3e9ec45750bd). You'll need to follow the steps in that repository to set up your USB Wi-Fi adapter (you will need a compatible USB Wi-Fi adapter). I've been using a cheap/generic AC1300 adapter in my testing. This is a Windows-only program. If you have experience with Linux, you can probably convert it to be Linux-compatible fairly easily. 
+If you don't have an ESP32, you'll need to set up ldnd.exe from [unlimitedcoder2](https://gist.github.com/unlimitedcoder2/af2f09694563c6a6cd3d3e9ec45750bd). You'll need to follow the steps in that repository to set up your USB Wi-Fi adapter (you will need a compatible USB Wi-Fi adapter). I've been using a cheap/generic AC1300 adapter in my testing. This is a Windows-only program. If you have experience with Linux, you can probably convert it to be Linux-compatible fairly easily. 
 
-If you're using the ESP32-S3, you'll need to either download the [ESP-IDF v5.2.8](https://dl.espressif.com/dl/esp-idf/) installer or use a web-based tool like [esptool](https://espressif.github.io/esptool-js/) to flash the firmware. Flash at address 0x0000. In Azahar, you'll need to go to Emulation > Configure > General > Network, and check the ESP32 box. Click "Connect" to verify that Azahar can find your ESP32. 
+If you're using the ESP32, you can use the firmware flasher to install the firmware easily. If you want to install it manually, you'll need to either download the [ESP-IDF v5.2.8](https://dl.espressif.com/dl/esp-idf/) installer or use a web-based tool like [esptool](https://espressif.github.io/esptool-js/) to flash the firmware. Flash at address 0x0000. For the aes_keys.txt feature, you don't need to add that unless you plan to also use the UDS Wrapper feature for original, non-Virtual Console Gameboy games. Either pass the keys in the firmware flasher while setting up your ESP32 or use "uds-esp32-probe COMX --store-key <file>" where X is your COM port, using the uds-esp32-probe script in the mGBA_LDN repository. You can also pass the keys from mGBA using Tools > Settings > BIOS > 3DS UDS key file and then running a Gameboy title. This feature is designed to be used with [mGBA_LDN](https://github.com/Gr3nSkyDragon/mgba_LDN), since 3DS Virtual Console games natively pass their data through a UDS wrapper and need no additional wrapping.
+
+To use the ESP32 during gameplay, in Azahar, you'll need to go to Emulation > Configure > General > Network, and check the ESP32 box. Click "Connect" to verify that Azahar can find your ESP32. 
 
 Gen 6 and 7 trading now work. I've personally confirmed the following:
 1) Trading between X and Y
 2) Trading between XY and ORAS (specifically X and AS)
 3) Trading between US and UM
 
+Gen 1 and 2 trading now working. I've personally confirmed the following:
+1) Trading between Red, Blue, and Yellow
+2) Trading between Gold, Silver, and Crystal
+3) Trading between Red and Gold, and Yellow and Gold for the Time Capsule feature
+
+I've also semi-confirmed battling? I was able to enter a battle between two copies of Gold (on accident lol) and forfeit cleanly. I've not significantly tested this feature.
+
 Configuration doesn't matter. The emulator can request the 3DS and vice versa. You **might** run into an issue if you try to add the emulator trainer as a friend. I haven't tested adding friends much beyond one error I got due to parental controls not being set up (lol).
 
 ### Trading
-In order to trade, start ldnd.exe before launching any emulator titles. Once ldnd.exe says it's ready, start your selected game in both the emulator and retail console. Navigate through the Local Wireless Trade menus to begin and complete the trade. Gen 6 uses the PSS, and Gen 7 uses the Festival Plaza.
-This mod is only designed to do local wireless trading. It isn't intended for trading over the internet. Any multiplayer features beyond trading may or may not work. I haven't tested anything other than trading at this point as that was my primary interest.
 
-### Android (experimental, `android-esp32` branch)
-On Android the radio is an **ESP32-S3 connected to the phone by USB-C** instead of a USB Wi-Fi adapter and ldnd.exe. Flash the board with [firmware/esp32-uds-bridge](firmware/esp32-uds-bridge/README.md), plug it into the phone's USB-C port, then turn on **Settings > Network > ESP32 local wireless** and start the game. Android asks for USB permission for the board the first time. This path has not been tested on hardware yet; see the firmware README for what is and isn't verified.
+-If using ldnd.exe
+
+In order to trade, start ldnd.exe before launching any emulator titles. Don't use the ldnrs revision, only the legacy 0.0.5 ldnd.exe build will work. Once ldnd.exe says it's ready, start your selected game in both the emulator and retail console. Navigate through the Local Wireless Trade menus to begin and complete the trade. Gen 6 uses the PSS, and Gen 7 uses the Festival Plaza. Gen 1 and 2 use the Pokemon Center and the Virtual Console's host-join menu. 
+
+-If using the ESP32
+
+Ensure your ESP32 is connected and the ESP32 feature is enabled in Azahar before starting the game. Go to Emulation > Configure > General > Network, and check the ESP32 box. Click "Connect" to verify that Azahar can find your ESP32. 
+
+This mod is only designed to do local wireless trading. It isn't intended for trading over the internet. Any multiplayer features beyond trading may or may not work. I haven't tested anything other than trading in Gen 6 and 7 at this point, as that was my primary interest. Gen 2 is the only generation I've done anything related to battling with, and that was an accident. (I picked the wrong window lol.)
+
+-If trading between Azahar and mGBA (Virtual Console)
+
+To trade locally between the two forks, run a single instance of mGBA and Azahar. In Azahar, go to Multiplayer and tick the box for "Local mGBA Virtual Console." **Before** starting mGBA, launch the Azahar Virtual Console title and host a trade session. **DO NOT** start the mGBA Gameboy title until Azahar is hosting a trade, and **DO NOT** accept the mGBA trainer until mGBA is ready to enter the trade room. In mGBA, go to Emulation > Wireless Adapter and check both "Local" and "Virtual Console (local only)". Once Azahar is hosting the trade, launch the mGBA Gameboy title and talk to the trade window lady. Once you reach the final "Please wait..." you can accept the mGBA trainer in Azahar. When choosing the Trade Center option, only one game needs to select it. It's recommended that you not mash through this option, as these games are fragile and prone to desync. 
+
+### ESP32 Screen
+
+We've added screen support! Similar to [pokeldn](https://github.com/Decryptu/pokeldn), we now have an animated screen that plays during communication. Not as fancy, but it's there. It *should* be compatible with most ESP32s, but I've only personally confirmed with the ESP32-S3, and only the SSD1309. In my testing, all three of the aforementioned screens have been interchangeable, but if you encounter any problems, please let me know. 
+
+If you have an SSD1306, SSD1315, or SSD1309 screen, you can connect them to the ESP32 according to this table:
+
+| Board | Screen SDA | Screen SCL | VCC | GND |
+|---|---|---|---|---|
+| ESP32-S3 | GPIO8 | GPIO9 | 3V3 | GND |
+| XIAO ESP32-S3 | D9 (GPIO8) | D10 (GPIO9) | 3V3 | GND |
+| XIAO ESP32-C6 | D4 (GPIO22) | D5 (GPIO23) | 3V3 | GND |
+| XIAO ESP32-C3 | D4 (GPIO6) | D5 (GPIO7) | 3V3 | GND |
+| Other C3 boards (e.g. SuperMini) | GPIO6 | GPIO7 | 3V3 | GND |
+
+### Android 
+
+On Android the radio is an **ESP32-S3 connected to the phone by USB-C** instead of a USB Wi-Fi adapter and ldnd.exe. Flash the board with [firmware/esp32-uds-bridge](firmware/esp32-uds-bridge/README.md), plug it into the phone's USB-C port, then turn on **Settings > Network > ESP32 local wireless** and start the game. Android asks for USB permission for the board the first time. 
 
 ---
 
