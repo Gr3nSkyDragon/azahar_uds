@@ -637,6 +637,7 @@ static int32_t start_wrapper(const struct request *request)
                              .trace = port_trace,
                          });
     udsWireSetGeneration(&s_wire, s_game->gen2 ? 2 : 1);
+    udsWireSetCartEcho(&s_wire, true); /* a menu the cartridge chose first reaches the 3DS (uds-wire.h) */
     s_exchanges = 0;
     memset(&s_timing, 0, sizeof(s_timing));
     s_rx_dropped = 0;
