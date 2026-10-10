@@ -37,4 +37,31 @@ bool gbwrap_active(void);
 /* From the Wi-Fi task: a received frame ({channel, rssi, flags, mpdu}, as UDS_EVT_RX). Only queues. */
 bool gbwrap_sink_rx(const uint8_t *payload, size_t length);
 
+/* Where the wrapper is, for the screen: the join (room), then the Pia session, then the cable (wire phase). */
+enum gbwrap_stage {
+    GBWRAP_SCANNING,    /* room SCAN: hopping 1/6/11 for a Virtual Console host's beacon */
+    GBWRAP_JOINING,     /* room AUTH / EAPOL */
+    GBWRAP_JOINED,      /* room JOINED, no session yet */
+    GBWRAP_SETUP,       /* session IDLE / SETUP */
+    GBWRAP_CLOSED,      /* session CLOSED: the host left */
+    GBWRAP_CABLE_DOWN,  /* session JOINED, wire DOWN */
+    GBWRAP_ROLES,       /* wire ROLE */
+    GBWRAP_LINKED,      /* wire IDLE */
+    GBWRAP_SYNC,        /* wire SYNC */
+    GBWRAP_MENU,        /* wire MENU */
+    GBWRAP_DATA,        /* wire PASS */
+};
+
+typedef struct {
+    bool active;
+    uint8_t gen;        /* 1 or 2 */
+    uint8_t channel;
+    uint8_t stage;      /* enum gbwrap_stage */
+    uint32_t frames_sent, frames_received;
+    char title[16];     /* the game's name for the screen: PKMN RED, PKMN CRYSTAL ... */
+} gbwrap_status_t;
+
+/* Any task: the snapshot the wrapper task last published (every pass while active). */
+void gbwrap_get_status(gbwrap_status_t *status);
+
 #endif

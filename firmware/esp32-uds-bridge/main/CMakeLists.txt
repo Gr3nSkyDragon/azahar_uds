@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "main.c" "radio.c" "uds_wire.c" "keys.c" "gbwrap.c"
+    SRCS "main.c" "radio.c" "uds_wire.c" "keys.c" "gbwrap.c" "display.c" "scene.c" "screen.c"
          # The Game Boy wrapper, copied unchanged from mGBA (mgba_LDN, src/gb/sio): see gbwrap/README.md.
          "gbwrap/uds-wire.c" "gbwrap/uds-cable.c" "gbwrap/uds-session.c" "gbwrap/uds-pia.c" "gbwrap/uds-room.c"
          "gbwrap/uds-ccmp.c"

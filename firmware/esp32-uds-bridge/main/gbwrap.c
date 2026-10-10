@@ -36,10 +36,11 @@
 struct gb_game {
     const char *title;
     bool gen2;
+    const char *name; /* on the board's screen */
 };
 static const struct gb_game kGames[] = {
-    {"POKEMON RED", false}, {"POKEMON BLU", false}, {"POKEMON YEL", false},
-    {"POKEMON_GLD", true},  {"POKEMON_SLV", true},  {"PM_CRYSTAL", true},
+    {"POKEMON RED", false, "PKMN RED"},  {"POKEMON BLU", false, "PKMN BLUE"},  {"POKEMON YEL", false, "PKMN YELLOW"},
+    {"POKEMON_GLD", true, "PKMN GOLD"},  {"POKEMON_SLV", true, "PKMN SILVER"}, {"PM_CRYSTAL", true, "PKMN CRYSTAL"},
 };
 
 /* Every Game Boy Virtual Console Pokemon network: the comm id is the title id plus 0x10 (Red 00171010, Gold 00172610, Silver
@@ -120,6 +121,10 @@ static unsigned s_exchanges;
 
 static uint8_t s_reported[4] = {0xFF, 0xFF, 0xFF, 0xFF};
 static uint32_t s_last_stats_ms;
+
+/* The screen's copy (gbwrap_get_status), written by the wrapper task. */
+static portMUX_TYPE s_status_lock = portMUX_INITIALIZER_UNLOCKED;
+static gbwrap_status_t s_status;
 
 #define RX_PER_PASS 4
 #define SLOW_PASS_US 100000
@@ -495,8 +500,51 @@ static void port_trace(void *context, const char *line)
 
 /* The task --------------------------------------------------------------------------------------------------------------- */
 
+static uint8_t stage(void)
+{
+    switch (s_room.state) {
+    case UDS_ROOM_SCAN: return GBWRAP_SCANNING;
+    case UDS_ROOM_AUTH:
+    case UDS_ROOM_EAPOL: return GBWRAP_JOINING;
+    case UDS_ROOM_JOINED: break;
+    }
+    if (!s_session_active) return GBWRAP_JOINED;
+    switch (s_session.state) {
+    case UDS_STATE_IDLE:
+    case UDS_STATE_SETUP: return GBWRAP_SETUP;
+    case UDS_STATE_CLOSED: return GBWRAP_CLOSED;
+    case UDS_STATE_JOINED: break;
+    }
+    switch (s_wire.phase) {
+    case UDS_WIRE_DOWN: return GBWRAP_CABLE_DOWN;
+    case UDS_WIRE_ROLE: return GBWRAP_ROLES;
+    case UDS_WIRE_IDLE: return GBWRAP_LINKED;
+    case UDS_WIRE_SYNC: return GBWRAP_SYNC;
+    case UDS_WIRE_MENU: return GBWRAP_MENU;
+    case UDS_WIRE_PASS: return GBWRAP_DATA;
+    }
+    return GBWRAP_CABLE_DOWN;
+}
+
+static void publish_status(bool active)
+{
+    gbwrap_status_t status = {.active = active};
+    if (active) {
+        status.gen = s_game && s_game->gen2 ? 2 : 1;
+        status.channel = s_air.channel;
+        status.stage = stage();
+        status.frames_sent = s_air.frames_sent;
+        status.frames_received = s_air.frames_received;
+        if (s_game) strncpy(status.title, s_game->name, sizeof(status.title) - 1);
+    }
+    portENTER_CRITICAL(&s_status_lock);
+    s_status = status;
+    portEXIT_CRITICAL(&s_status_lock);
+}
+
 static void report_state(void)
 {
+    publish_status(true);
     uint8_t state[4] = {(uint8_t)s_room.state, s_session_active ? (uint8_t)s_session.state : 0xFF, (uint8_t)s_wire.phase,
                         s_air.channel};
     if (memcmp(state, s_reported, sizeof(state))) {
@@ -563,6 +611,7 @@ static void stop_wrapper(void)
 {
     if (!s_active) return;
     s_active = false;
+    publish_status(false);
     radio_stop();
     memset(s_air.slot_key, 0, sizeof(s_air.slot_key));
     memset(s_air.data_key, 0, sizeof(s_air.data_key));
@@ -715,6 +764,13 @@ void gbwrap_request(uint8_t type, uint8_t seq, const uint8_t *payload, size_t le
 bool gbwrap_active(void)
 {
     return s_active;
+}
+
+void gbwrap_get_status(gbwrap_status_t *status)
+{
+    portENTER_CRITICAL(&s_status_lock);
+    *status = s_status;
+    portEXIT_CRITICAL(&s_status_lock);
 }
 
 bool gbwrap_sink_rx(const uint8_t *payload, size_t length)

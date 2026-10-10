@@ -2630,6 +2630,12 @@ std::vector<u8> AddRadiotapHeader(std::span<const u8> frame, bool no_ack) {
 
 constexpr std::array<u8, 8> RadiotapEmpty{0, 0, 8, 0, 0, 0, 0, 0};
 
+// Frames sent to the device per pass before reading from it again. One thread does both, and a
+// game can queue frames faster than the USB link and the air carry them (a Virtual Console block
+// burst, or the resends of one that went unacknowledged): draining the whole queue first starved
+// the reads, the device's writes to us timed out and its pongs never arrived.
+constexpr std::size_t Esp32TxFramesPerPass = 4;
+
 // The shared generators emit a minimal 8-byte radiotap header for monitor injection; the ESP32
 // takes the bare MPDU.
 std::vector<u8> StripRadiotap(std::vector<u8> packet) {
@@ -2716,7 +2722,8 @@ public:
         if (!port) {
             return false;
         }
-        std::array<u8, 2048> buffer;
+        // Big enough for a pass's worth of full-size Rx frames, so reading keeps up with a burst.
+        std::array<u8, 16384> buffer;
         const int count = port->Read(buffer, timeout_ms);
         if (count < 0) {
             port.reset();
@@ -2906,8 +2913,15 @@ void RunEsp32Body(std::atomic<bool>& stop_requested, std::atomic<u16>& selected_
                      current_channel);
         }
 
-        // Frames queued by nwm::UDS. The device injects them in order.
-        while (auto pending_frame = physical_frame_provider()) {
+        // Frames queued by nwm::UDS, a few per pass (Esp32TxFramesPerPass). The device injects
+        // them in order.
+        std::size_t sent_this_pass = 0;
+        while (sent_this_pass < Esp32TxFramesPerPass) {
+            auto pending_frame = physical_frame_provider();
+            if (!pending_frame) {
+                break;
+            }
+            ++sent_this_pass;
             std::vector<u8> payload;
             payload.reserve(2 + pending_frame->size());
             u8 flags = 0;
@@ -2953,8 +2967,9 @@ void RunEsp32Body(std::atomic<bool>& stop_requested, std::atomic<u16>& selected_
         }
 
         // Read what the radio captured. The short timeout bounds the latency of the TX queue
-        // above; Read returns as soon as bytes arrive.
-        if (!session.Pump(3)) {
+        // above (no wait at all while it still holds frames); Read returns as soon as bytes
+        // arrive.
+        if (!session.Pump(sent_this_pass == Esp32TxFramesPerPass ? 1 : 3)) {
             LOG_WARNING(Service_NWM, "UDS Real ESP32: link lost; reconnecting");
             continue;
         }

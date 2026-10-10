@@ -2,3 +2,5 @@ build/
 sdkconfig
 sdkconfig.old
 managed_components/
+tools/screen_preview/out/
+__pycache__/

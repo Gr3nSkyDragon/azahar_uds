@@ -43,5 +43,8 @@ esp_err_t radio_set_beacon(const uint8_t *mpdu, size_t length);
 void radio_set_watch(const uint8_t mac[6]);
 void radio_get_stats(uds_stats_t *stats);
 void radio_note_usb_dropped(void);
+/* For the screen: started (by the host or the wrapper) and on which channel. */
+bool radio_running(void);
+uint8_t radio_channel(void);
 
 #endif

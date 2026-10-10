@@ -24,6 +24,29 @@ Any ESP32-S3 board. **Use the chip's native USB port** (the one wired to GPIO19/
 what the app looks for. Connect it to the phone with a USB-C cable (a USB-C to USB-C cable, or an OTG
 adapter). The board is powered from the phone; 2.4 GHz radio TX draws a few hundred mA.
 
+### Optional screen (firmware 1.5)
+
+A 128x64 SSD1306 I2C OLED (the common four-pin 0.96" module): **SDA to GPIO8, SCL to GPIO9, VCC to
+3V3, GND to GND**. The firmware looks for it at 0x3C, then 0x3D, once at boot, so connect it before
+powering the board; without one the board runs exactly as before. It shows the firmware and whether a
+host has said HELLO, the raw radio's channel and frame counts while Azahar drives it, and the Game Boy
+wrapper's game, join/session/cable stage and frame counts. After a minute with nothing happening it
+dims, after ten it turns off; BOOT wakes it.
+
+What it draws is `main/scene.c` (layout, icons, wording) using the calls in `main/screen.h`, on a
+128x64 grid with (0, 0) at the top left. Two tools in `tools/` (Python 3, nothing to install):
+
+- **Preview without flashing:** `python tools/screen_preview.py` builds `scene.c` with a PC compiler
+  (MSYS2's gcc is found by itself) and writes every clip listed in `tools/screen_preview/preview.c`
+  to `tools/screen_preview/out/`: a PNG per clip, an animated GIF for moving ones, and `all.png`
+  with all of them. `--color twotone` shows the yellow-band modules; add a clip to `kClips` to
+  preview a new state.
+- **Pictures to C:** `python tools/img2c.py -o main/images.h art/ball.png` turns PNGs into one-bit
+  images, drawn with `fb_image(fb, x, y, IMG_BALL_W, IMG_BALL_H, kImgBall, true)`. `--mode dark`
+  for art drawn black on white, `--frames N` for N animation frames side by side, `--mode sprite
+  --size 48` for colour Pokemon sprites; it prints each picture in the terminal, and `--preview
+  out.png` writes it enlarged.
+
 ## Flashing a pre-built firmware (no ESP-IDF needed)
 
 Each release ships one file, `esp32-uds-bridge-fw<version>-esp32s3.bin` (bootloader, partition table

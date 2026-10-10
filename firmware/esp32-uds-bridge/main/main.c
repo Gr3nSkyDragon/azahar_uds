@@ -14,13 +14,14 @@
 #include "freertos/ringbuf.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "display.h"
 #include "gbwrap.h"
 #include "keys.h"
 #include "radio.h"
 #include "uds_wire.h"
 
 #define FW_MAJOR 1
-#define FW_MINOR 4
+#define FW_MINOR 5
 #define PROTOCOL_VERSION UDS_WIRE_VERSION
 #define RX_RING_BYTES (48 * 1024)
 #define STATS_INTERVAL_US (5 * 1000 * 1000)
@@ -28,6 +29,7 @@
 static RingbufHandle_t s_rx_ring;
 static SemaphoreHandle_t s_write_lock;
 static uint8_t s_encoded[UDS_WIRE_MAX_ENCODED];
+static volatile bool s_host_seen;
 
 /* Serialized writer: the command task and the RX forwarder both send frames. */
 static void send_frame(uint8_t type, uint8_t seq, uint8_t flags, const uint8_t *payload,
@@ -106,6 +108,32 @@ static void stats_task(void *arg)
     }
 }
 
+/* The screen's snapshot (display.h): the wrapper when it runs, otherwise the raw radio, otherwise idle. */
+static void display_status(scene_status_t *status)
+{
+    status->fw_major = FW_MAJOR;
+    status->fw_minor = FW_MINOR;
+    status->host_seen = s_host_seen;
+    gbwrap_status_t wrapper;
+    gbwrap_get_status(&wrapper);
+    if (wrapper.active) {
+        status->mode = SCENE_WRAPPER;
+        status->gen = wrapper.gen;
+        status->stage = wrapper.stage;
+        status->channel = wrapper.channel;
+        status->rx = wrapper.frames_received;
+        status->tx = wrapper.frames_sent;
+        memcpy(status->title, wrapper.title, sizeof(status->title));
+    } else if (radio_running()) {
+        uds_stats_t stats;
+        radio_get_stats(&stats);
+        status->mode = SCENE_RADIO;
+        status->channel = radio_channel();
+        status->rx = stats.rx_forwarded;
+        status->tx = stats.tx_ok;
+    }
+}
+
 static void handle_command(uds_wire_frame_t *frame)
 {
     const uint8_t *p = frame->payload;
@@ -154,6 +182,8 @@ static void handle_command(uds_wire_frame_t *frame)
 
     switch (frame->type) {
     case UDS_CMD_HELLO: {
+        s_host_seen = true;
+        display_wake();
         uint8_t payload[9] = {PROTOCOL_VERSION, FW_MAJOR, FW_MINOR};
         esp_efuse_mac_get_default(payload + 3);
         send_frame(UDS_EVT_HELLO_ACK, frame->seq, 0, payload, sizeof(payload));
@@ -210,6 +240,7 @@ void app_main(void)
     keys_init();
     radio_init(event_sink);
     gbwrap_init(gbwrap_send);
+    display_start(display_status); /* optional: without a screen this does nothing */
 
     xTaskCreate(rx_forward_task, "rx_fwd", 4096, NULL, 6, NULL);
     xTaskCreate(stats_task, "stats", 3072, NULL, 2, NULL);

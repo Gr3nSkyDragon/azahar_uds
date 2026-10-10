@@ -332,3 +332,5 @@ void radio_set_watch(const uint8_t mac[6])
 
 void radio_get_stats(uds_stats_t *stats) { *stats = s_stats; }
 void radio_note_usb_dropped(void) { ++s_stats.usb_dropped; }
+bool radio_running(void) { return s_running; }
+uint8_t radio_channel(void) { return s_channel; }
