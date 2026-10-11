@@ -2,10 +2,14 @@
  *
  * The Game Boy wrapper mode. Without it the board is the raw radio Azahar drives (main.c). In it, the board itself joins a 3DS
  * running the Virtual Console Pokemon games (Red, Blue, Yellow, Gold, Silver, Crystal) and stands in for that console's partner on a
- * link cable: the host only carries the cartridge's serial transfers. The cartridge is the master of the cable; for every transfer it
- * starts, the host sends the byte it clocked out (UDS_CMD_GB_XFER) and the board answers with the byte the slave shifts back
- * (UDS_EVT_GB_REPLY). The cartridge may be a real one behind an adapter or an emulator standing in for one (mGBA's Wireless Adapter >
- * ESP32 with "Virtual Console" unticked).
+ * link cable: the host only carries the cartridge's serial transfers, one of two ways (GB_START's flags):
+ *  - The cartridge is the master of the cable: for every transfer it starts, the host sends the byte it clocked out
+ *    (UDS_CMD_GB_XFER) and the board answers with the byte the slave shifts back (UDS_EVT_GB_REPLY).
+ *  - Firmware 1.6 on, UDS_GB_START_PICO: the cartridge is the slave behind a GB-Link Pico in Game Boy mode, whose SPI only clocks,
+ *    as a real GB-Link has it. The board drives the clock (uds-clock.c, the same rules mGBA's Local mode runs) and speaks the Pico's
+ *    own frames inside UDS_EVT_GB_PICO / UDS_CMD_GB_PICO: set the mode, then one byte to clock at a time, the byte it shifted in
+ *    coming back. mGBA's Wireless Adapter > ESP32 stands in for the Pico over USB.
+ * The cartridge may be a real one behind an adapter or an emulator standing in for one.
  *
  * Everything between is the wrapper mGBA ran on the PC (src/gb/sio in the mgba_LDN repository), copied unchanged into gbwrap/: the
  * permanent slave (uds-wire.c, uds-cable.c), the Pia session (uds-session.c, uds-pia.c), the join (uds-room.c) and CCMP (uds-ccmp.c).

@@ -21,7 +21,7 @@
 #include "uds_wire.h"
 
 #define FW_MAJOR 1
-#define FW_MINOR 5
+#define FW_MINOR 6
 #define PROTOCOL_VERSION UDS_WIRE_VERSION
 #define RX_RING_BYTES (48 * 1024)
 #define STATS_INTERVAL_US (5 * 1000 * 1000)
@@ -144,6 +144,7 @@ static void handle_command(uds_wire_frame_t *frame)
     case UDS_CMD_GB_START:
     case UDS_CMD_GB_XFER:
     case UDS_CMD_GB_STOP:
+    case UDS_CMD_GB_PICO:
         gbwrap_request(frame->type, frame->seq, p, n); /* the wrapper task answers */
         return;
     case UDS_CMD_SET_KEY:

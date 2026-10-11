@@ -21,6 +21,7 @@
 #include "uds_wire.h"
 
 #include <mgba/internal/gb/sio/uds-ccmp.h>
+#include <mgba/internal/gb/sio/uds-clock.h>
 #include <mgba/internal/gb/sio/uds-room.h>
 #include <mgba/internal/gb/sio/uds-session.h>
 #include <mgba/internal/gb/sio/uds-wire.h>
@@ -76,7 +77,7 @@ struct request {
     uint8_t type;
     uint8_t seq;
     uint8_t length;
-    uint8_t data[40];
+    uint8_t data[72]; /* GB_START's 37, or a Pico frame (5 + up to 64) */
 };
 
 static gbwrap_send_t s_send;
@@ -119,6 +120,53 @@ static bool s_leave_resent;
 static struct UDSWire s_wire;
 static unsigned s_exchanges;
 
+/* Who is on the other end of the cartridge's cable (GB_START flag bit 1, see uds_wire.h). XFER: the cartridge is the master and the
+ * host sends each transfer it clocked. PICO: the cartridge sits behind a GB-Link Pico in Game Boy mode, which only clocks, so this
+ * board drives the clock (uds-clock.c) and the Pico shifts each byte; the Pico is a real one or mGBA standing in for one, and either
+ * way speaks the Pico's own frames (GB-Link GBLink-Firmware 2.2.7: serialLayer, gb.cpp, control.hpp). */
+enum front { FRONT_XFER, FRONT_PICO };
+static uint8_t s_front;
+static struct UDSClock s_clock;
+
+#define PICO_SYNC0 0x47 /* 'G' */
+#define PICO_SYNC1 0x42 /* 'B' */
+#define PICO_CHANNEL_COMMAND 0x00
+#define PICO_CHANNEL_DATA 0x01
+#define PICO_CHANNEL_STATUS 0x02
+#define PICO_MAX_PAYLOAD 64
+#define PICO_CMD_SET_MODE 0x00 /* {mode} */
+#define PICO_CMD_CANCEL 0x01
+#define PICO_MODE_GB_LINK 0x02
+#define PICO_CMD_SET_TIMING 0x30 /* {us between transfers:u24 LE, bytes per transfer:u8} */
+#define PICO_STATUS_GB_MODE_ACTIVE 0xFF0A
+#define PICO_STATUS_GB_SESSION_FINISHED 0xFF0C
+#define PICO_SETUP_RESEND_US 500000
+#define PICO_REPLY_TIMEOUT_US 250000
+/* The waits after an exchange (uds-clock.h), in real time. mGBA's Local mode, where these were tested, counts them in emulated
+ * cycles (105336, 8389 and 4194 at 8388608 a second: 12.6 ms, 1 ms, 0.5 ms) and adds 75 us for the UART; here the round trip to the
+ * Pico comes on top. In idle, sync and menu the clock must reach the cartridge in every frame (16.7 ms): a Gen 1 sync's last loop is
+ * ten frames of one 00 each that do not wait for the clock, and the wire counts all ten. So the loop gap is shorter than Local's, to
+ * keep gap and round trip near Local's 0.75 frame with room for a slow one. */
+#define PICO_GAP_LOOP_US 10000
+#define PICO_GAP_ROLE_US 1000
+#define PICO_GAP_BYTE_US 500
+
+static struct {
+    bool running;           /* the Pico is in Game Boy mode: clock */
+    bool awaiting;          /* a byte is out, its reply not back */
+    enum UDSClockGap gap;   /* the wait after the byte that is out */
+    int64_t setup_us;       /* when the mode was last asked for */
+    int64_t sent_us;
+    int64_t next_us;        /* when the next byte may go */
+    unsigned timeouts, stray_replies, setups;
+    uint32_t round_trips, round_trip_max_us; /* since the last report */
+    uint64_t round_trip_sum_us;
+    /* The frame being received (the Pico's serialLayer parser). */
+    uint8_t rx_state, rx_channel;
+    uint16_t rx_length, rx_pos;
+    uint8_t rx[PICO_MAX_PAYLOAD];
+} s_pico;
+
 static uint8_t s_reported[4] = {0xFF, 0xFF, 0xFF, 0xFF};
 static uint32_t s_last_stats_ms;
 
@@ -144,7 +192,7 @@ static uint32_t now_ms(void)
 static void logf_host(const char *format, ...)
 {
     if (!s_trace) return;
-    char line[160];
+    char line[256];
     va_list args;
     va_start(args, format);
     int length = vsnprintf(line, sizeof(line), format, args);
@@ -498,6 +546,158 @@ static void port_trace(void *context, const char *line)
     logf_host("%s", line);
 }
 
+/* The cartridge behind a Pico: this board drives the clock (uds-clock.c) ----------------------------------------------------- */
+
+static void clock_trace(void *context, const char *line)
+{
+    (void)context;
+    logf_host("%s", line);
+}
+
+/* One frame to the Pico. It goes to the host (mGBA standing in for a Pico); a real Pico on the bridge UART takes the same bytes. */
+static void pico_send(uint8_t channel, const uint8_t *payload, size_t length)
+{
+    uint8_t frame[5 + PICO_MAX_PAYLOAD];
+    if (length > PICO_MAX_PAYLOAD) return;
+    frame[0] = PICO_SYNC0;
+    frame[1] = PICO_SYNC1;
+    frame[2] = channel;
+    frame[3] = (uint8_t)length;
+    frame[4] = (uint8_t)(length >> 8);
+    if (length) memcpy(frame + 5, payload, length);
+    s_send(UDS_EVT_GB_PICO, 0, frame, 5 + length);
+}
+
+static int64_t gap_us(enum UDSClockGap gap)
+{
+    switch (gap) {
+    case UDS_CLOCK_GAP_ROLE: return PICO_GAP_ROLE_US;
+    case UDS_CLOCK_GAP_BYTE: return PICO_GAP_BYTE_US;
+    case UDS_CLOCK_GAP_LOOP:
+    default: return PICO_GAP_LOOP_US;
+    }
+}
+
+/* The byte that was out came back (or was given up on): the clock's rules take it, and the next waits its gap. */
+static void pico_exchanged(uint8_t reply)
+{
+    const uint32_t round_trip_us = (uint32_t)(esp_timer_get_time() - s_pico.sent_us);
+    ++s_pico.round_trips;
+    s_pico.round_trip_sum_us += round_trip_us;
+    if (round_trip_us > s_pico.round_trip_max_us) s_pico.round_trip_max_us = round_trip_us;
+    s_pico.awaiting = false;
+    udsClockExchanged(&s_clock, s_now, reply);
+    ++s_exchanges;
+    s_pico.next_us = esp_timer_get_time() + gap_us(s_pico.gap);
+}
+
+static void pico_frame(uint8_t channel, const uint8_t *payload, size_t length)
+{
+    if (channel == PICO_CHANNEL_STATUS && length >= 2) {
+        const uint16_t status = (uint16_t)(payload[0] | (payload[1] << 8));
+        if (status == PICO_STATUS_GB_MODE_ACTIVE && !s_pico.running) {
+            /* The Pico waits 1 ms after each byte before it answers unless told otherwise: the gaps are this board's (uds-clock.h). */
+            const uint8_t timing[5] = {PICO_CMD_SET_TIMING, 0, 0, 0, 1};
+            pico_send(PICO_CHANNEL_COMMAND, timing, sizeof(timing));
+            s_pico.running = true;
+            s_pico.awaiting = false;
+            s_pico.next_us = esp_timer_get_time();
+            logf_host("pico: Game Boy mode active; clocking");
+        } else if (status == PICO_STATUS_GB_SESSION_FINISHED && s_pico.running) {
+            s_pico.running = false;
+            s_pico.setup_us = 0;
+            logf_host("pico: it left Game Boy mode; asking again");
+        }
+        return;
+    }
+    if (channel == PICO_CHANNEL_DATA && length >= 1) {
+        if (s_pico.awaiting) {
+            pico_exchanged(payload[0]); /* one byte goes out at a time */
+        } else {
+            ++s_pico.stray_replies;
+        }
+    }
+}
+
+/* The Pico's frames, byte by byte as its own serialLayer parses them, so that a stream from a UART can be fed in the same way. */
+static void pico_feed(uint8_t b)
+{
+    switch (s_pico.rx_state) {
+    case 0:
+        if (b == PICO_SYNC0) s_pico.rx_state = 1;
+        break;
+    case 1:
+        if (b == PICO_SYNC1) s_pico.rx_state = 2;
+        else if (b != PICO_SYNC0) s_pico.rx_state = 0;
+        break;
+    case 2:
+        s_pico.rx_channel = b;
+        s_pico.rx_state = 3;
+        break;
+    case 3:
+        s_pico.rx_length = b;
+        s_pico.rx_state = 4;
+        break;
+    case 4:
+        s_pico.rx_length |= (uint16_t)(b << 8);
+        s_pico.rx_pos = 0;
+        if (s_pico.rx_length > PICO_MAX_PAYLOAD) {
+            s_pico.rx_state = 0; /* oversized: resynchronize */
+        } else if (!s_pico.rx_length) {
+            pico_frame(s_pico.rx_channel, s_pico.rx, 0);
+            s_pico.rx_state = 0;
+        } else {
+            s_pico.rx_state = 5;
+        }
+        break;
+    default:
+        s_pico.rx[s_pico.rx_pos++] = b;
+        if (s_pico.rx_pos >= s_pico.rx_length) {
+            pico_frame(s_pico.rx_channel, s_pico.rx, s_pico.rx_length);
+            s_pico.rx_state = 0;
+        }
+        break;
+    }
+}
+
+/* GB_PICO {Pico frame} from the host. */
+static void pico_receive(const struct request *request)
+{
+    if (!s_active || s_front != FRONT_PICO) return;
+    for (uint8_t i = 0; i < request->length; ++i) pico_feed(request->data[i]);
+}
+
+/* Each pass: until the Pico is in Game Boy mode ask for it; then one byte at a time, each after the gap the last one chose. */
+static void pico_poll(void)
+{
+    const int64_t now_us = esp_timer_get_time();
+    if (!s_pico.running) {
+        if (!s_pico.setup_us || now_us - s_pico.setup_us >= PICO_SETUP_RESEND_US) {
+            const uint8_t mode[2] = {PICO_CMD_SET_MODE, PICO_MODE_GB_LINK};
+            pico_send(PICO_CHANNEL_COMMAND, mode, sizeof(mode));
+            s_pico.setup_us = now_us;
+            if (++s_pico.setups == 1) logf_host("pico: asking for Game Boy mode");
+        }
+        return;
+    }
+    if (s_pico.awaiting) {
+        if (now_us - s_pico.sent_us > PICO_REPLY_TIMEOUT_US) {
+            ++s_pico.timeouts;
+            logf_host("pico: no reply to a byte in %d ms (%u so far): taken as FF, nobody shifted", (int)(PICO_REPLY_TIMEOUT_US / 1000),
+                      s_pico.timeouts);
+            pico_exchanged(0xFF);
+        }
+        return;
+    }
+    if (s_wire.phase == UDS_WIRE_DOWN || now_us < s_pico.next_us) return;
+    s_pico.gap = udsClockGap(&s_clock);
+    uint8_t byte;
+    if (!udsClockPrepare(&s_clock, s_now, &byte)) return; /* the mail hold: look again on the next pass */
+    pico_send(PICO_CHANNEL_DATA, &byte, 1);
+    s_pico.awaiting = true;
+    s_pico.sent_us = now_us;
+}
+
 /* The task --------------------------------------------------------------------------------------------------------------- */
 
 static uint8_t stage(void)
@@ -561,6 +761,16 @@ static void report_state(void)
         for (int i = 0; i < 10; ++i)
             for (int b = 0; b < 4; ++b) payload[i * 4 + b] = (uint8_t)(values[i] >> (8 * b));
         s_send(UDS_EVT_GB_STATS, 0, payload, sizeof(payload));
+        if (s_front == FRONT_PICO) {
+            logf_host("clock (Pico): %u exchanges to the wire, %u kept from it; %u bytes with no reply, %u replies with no byte out; "
+                      "%lu bytes in 5 s, round trip %lu us on average, %lu at most",
+                      s_clock.exchanges, s_clock.quiet, s_pico.timeouts, s_pico.stray_replies, (unsigned long)s_pico.round_trips,
+                      (unsigned long)(s_pico.round_trips ? s_pico.round_trip_sum_us / s_pico.round_trips : 0),
+                      (unsigned long)s_pico.round_trip_max_us);
+            s_pico.round_trips = 0;
+            s_pico.round_trip_sum_us = 0;
+            s_pico.round_trip_max_us = 0;
+        }
     }
 }
 
@@ -590,6 +800,7 @@ static bool service(void)
     air_poll();
     joiner_poll();
     udsWirePoll(&s_wire, s_now);
+    if (s_front == FRONT_PICO) pico_poll();
     report_state();
     const uint32_t pass_us = (uint32_t)(esp_timer_get_time() - start);
     if (pass_us > s_timing.max_pass_us) s_timing.max_pass_us = pass_us;
@@ -610,6 +821,10 @@ static bool service(void)
 static void stop_wrapper(void)
 {
     if (!s_active) return;
+    if (s_front == FRONT_PICO && s_pico.running) {
+        const uint8_t cancel[1] = {PICO_CMD_CANCEL};
+        pico_send(PICO_CHANNEL_COMMAND, cancel, sizeof(cancel));
+    }
     s_active = false;
     publish_status(false);
     radio_stop();
@@ -642,7 +857,7 @@ static int32_t start_wrapper(const struct request *request)
     memset(&s_air, 0, sizeof(s_air));
     if (!keys_load(UDS_KEY_SLOT_DATA, s_air.slot_key)) return ESP_ERR_NOT_FOUND;
 
-    s_trace = request->data[0] & 1;
+    s_trace = request->data[0] & UDS_GB_START_LOG;
     memset(s_name, 0, sizeof(s_name));
     if (request->length >= 1 + 16 + 20) {
         for (int i = 0; i < UDS_NAME_WORDS; ++i) s_name[i] = (uint16_t)(request->data[17 + 2 * i] | (request->data[18 + 2 * i] << 8));
@@ -687,13 +902,18 @@ static int32_t start_wrapper(const struct request *request)
                          });
     udsWireSetGeneration(&s_wire, s_game->gen2 ? 2 : 1);
     udsWireSetCartEcho(&s_wire, true); /* a menu the cartridge chose first reaches the 3DS (uds-wire.h) */
+    s_front = (request->data[0] & UDS_GB_START_PICO) ? FRONT_PICO : FRONT_XFER;
+    memset(&s_pico, 0, sizeof(s_pico));
+    udsClockInit(&s_clock, &s_wire, true, UDS_CLOCK_MAIL_HOLD_AHEAD);
+    if (s_trace) udsClockSetTrace(&s_clock, clock_trace, NULL);
     s_exchanges = 0;
     memset(&s_timing, 0, sizeof(s_timing));
     s_rx_dropped = 0;
     memset(s_reported, 0xFF, sizeof(s_reported));
     s_last_stats_ms = 0;
     s_active = true;
-    logf_host("wrapper started for %s (Gen %d)", s_game->title, s_game->gen2 ? 2 : 1);
+    logf_host("wrapper started for %s (Gen %d)%s", s_game->title, s_game->gen2 ? 2 : 1,
+              s_front == FRONT_PICO ? ", the cartridge behind a Pico: this board drives the clock" : "");
     return ESP_OK;
 }
 
@@ -701,7 +921,7 @@ static int32_t start_wrapper(const struct request *request)
 static void transfer(const struct request *request)
 {
     uint8_t payload[2] = {UDS_WIRE_IDLE_LINE, 0xFF};
-    if (s_active && request->length >= 1) {
+    if (s_active && s_front == FRONT_XFER && request->length >= 1) {
         service();
         payload[0] = udsWirePreload(&s_wire);
         udsWireExchanged(&s_wire, s_now, request->data[0]);
@@ -719,6 +939,9 @@ static void handle(const struct request *request)
         break;
     case UDS_CMD_GB_XFER:
         transfer(request);
+        break;
+    case UDS_CMD_GB_PICO:
+        pico_receive(request);
         break;
     case UDS_CMD_GB_STOP:
     case UDS_CMD_STOP:

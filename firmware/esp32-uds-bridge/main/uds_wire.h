@@ -36,9 +36,15 @@
 #define UDS_CMD_KEY_STATUS 0x0B /* {} -> KEY_INFO */
 #define UDS_CMD_ERASE_KEYS 0x0C /* {} */
 /* The Game Boy wrapper mode (gbwrap.h). Azahar never sends these; the raw radio commands above are refused while it runs. */
-#define UDS_CMD_GB_START 0x10   /* {flags:u8 (bit 0: log), title[16] (cartridge header, 0x134), name[20] (UTF-16LE)} */
+#define UDS_CMD_GB_START 0x10   /* {flags:u8 (bit 0: log, bit 1: Pico), title[16] (cartridge header, 0x134), name[20] (UTF-16LE)} */
 #define UDS_CMD_GB_XFER 0x11    /* {master:u8}: the cartridge clocked a transfer out -> GB_REPLY */
 #define UDS_CMD_GB_STOP 0x12    /* {} */
+/* Firmware 1.6 on: the cartridge behind a GB-Link Pico in Game Boy mode (GB_START flag bit 1), the board driving the clock. The
+ * payload is one frame of the Pico's own serial protocol (| 47 42 | channel | length:u16 LE | payload |), so the host that stands in
+ * for a Pico (mGBA) speaks exactly what a real one does. */
+#define UDS_CMD_GB_PICO 0x13    /* {Pico frame}: from the Pico (data: the bytes it shifted in; status) */
+#define UDS_GB_START_LOG 0x01
+#define UDS_GB_START_PICO 0x02
 
 /* Device -> host. */
 #define UDS_EVT_HELLO_ACK 0x81 /* {proto:u8, fw_major:u8, fw_minor:u8, factory_mac[6]} */
@@ -53,6 +59,7 @@
 #define UDS_EVT_GB_REPLY 0x91  /* {slave:u8, wire phase:u8}, echoes the GB_XFER seq */
 #define UDS_EVT_GB_STATS 0x92  /* 10 x u32 LE: beacons, frames sent, frames received, dropped (decrypt, replay, other), tx failed,
                                   units sent, units received, transfers; every 5 s */
+#define UDS_EVT_GB_PICO 0x93   /* {Pico frame}: to the Pico (command: set the mode, the timing; data: the bytes to clock) */
 
 #define UDS_TX_NO_ACK 0x01
 #define UDS_RX_TRUNCATED 0x01

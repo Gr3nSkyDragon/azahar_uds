@@ -136,9 +136,18 @@ runs, the raw radio commands are refused (`ESP_ERR_INVALID_STATE`) and received 
 | `0x0A` SET_KEY | `slot:u8 (0x2D), key[16]` | STATUS. Stored in flash (NVS), never sent back. `idf.py flash` leaves it; a release image written at 0x0 erases it |
 | `0x0B` KEY_STATUS | none | `0x88` KEY_INFO `{slot, present}` |
 | `0x0C` ERASE_KEYS | none | STATUS |
-| `0x10` GB_START | `flags:u8 (bit 0: log), title[16] (cartridge header at 0x134), name[20] (UTF-16LE)` | STATUS: 0, `0x105` no key stored, `0x106` unknown game |
+| `0x10` GB_START | `flags:u8 (bit 0: log, bit 1: Pico), title[16] (cartridge header at 0x134), name[20] (UTF-16LE)` | STATUS: 0, `0x105` no key stored, `0x106` unknown game |
 | `0x11` GB_XFER | `master:u8`, the byte the cartridge clocked out | `0x91` GB_REPLY `{slave:u8, wire phase:u8}`, the byte shifted back in the same transfer |
 | `0x12` GB_STOP | none | STATUS (STOP does the same while the wrapper runs) |
+| `0x13` GB_PICO | a frame of the GB-Link Pico's protocol, from the Pico (1.6) | none |
+
+Firmware 1.6 adds the **GB-Link model** (GB_START flag bit 1): the cartridge is the slave behind a GB-Link Pico in Game Boy mode,
+whose SPI only clocks, and the board drives the clock with the same rules mGBA's Local mode runs (`main/gbwrap/uds-clock.c`). The
+board speaks the Pico's own serial protocol (GB-Link GBLink-Firmware 2.2.7: `| 47 42 | channel | length:u16 LE | payload |`, channel
+0 commands, 1 data, 2 status) inside `0x93` GB_PICO frames to the host and GB_PICO commands from it: SetMode Game Boy (`00 02`)
+until the Pico reports `0xFF0A`, SetTimingConfig with no wait of its own (`30 00 00 00 01`), then one byte to clock per data frame,
+the byte the Pico shifted in coming back. mGBA's Wireless Adapter > ESP32 stands in for the Pico over USB; a real Pico on the board's
+UART takes the same frames. Without the flag the cartridge is the master, as in 1.4 and 1.5.
 
 While the wrapper runs the board also sends `0x90` GB_STATE `{room, session, wire phase, generation, channel}` on every change,
 `0x92` GB_STATS (10 × u32: beacons, frames sent and received, frames dropped for decryption, replay and other reasons, tx failures,
