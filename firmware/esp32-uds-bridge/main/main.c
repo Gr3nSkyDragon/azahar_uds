@@ -21,7 +21,7 @@
 #include "uds_wire.h"
 
 #define FW_MAJOR 1
-#define FW_MINOR 6
+#define FW_MINOR 7
 #define PROTOCOL_VERSION UDS_WIRE_VERSION
 #define RX_RING_BYTES (48 * 1024)
 #define STATS_INTERVAL_US (5 * 1000 * 1000)
@@ -184,6 +184,7 @@ static void handle_command(uds_wire_frame_t *frame)
     switch (frame->type) {
     case UDS_CMD_HELLO: {
         s_host_seen = true;
+        gbwrap_host_hello(); /* a wrapper the board started on its own (a GB-Link on the UART) gives the board to the host */
         display_wake();
         uint8_t payload[9] = {PROTOCOL_VERSION, FW_MAJOR, FW_MINOR};
         esp_efuse_mac_get_default(payload + 3);

@@ -1,0 +1,21 @@
+menu "UDS bridge"
+
+config UDS_PICO_LINK
+    bool "GB-Link (Pico) wired to a UART"
+    default n
+    help
+        A GB-Link wired to this board with three wires, as GB-Link's own ESP32 firmware allows (UART 1 at 921600; the Pico's bridge
+        UART is its uart1, GP8 TX and GP9 RX). With no host on USB the board asks it for Game Boy mode and runs the Game Boy wrapper
+        on its own. Off by default: the supported way is both boards on a PC's USB with uds-gblink-relay (mGBA's tools) in between.
+
+config UDS_PICO_LINK_TX_GPIO
+    int "GPIO wired to the GB-Link's GP9 (its UART RX)"
+    depends on UDS_PICO_LINK
+    default 2
+
+config UDS_PICO_LINK_RX_GPIO
+    int "GPIO wired to the GB-Link's GP8 (its UART TX)"
+    depends on UDS_PICO_LINK
+    default 1
+
+endmenu

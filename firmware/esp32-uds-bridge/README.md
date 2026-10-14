@@ -136,7 +136,7 @@ runs, the raw radio commands are refused (`ESP_ERR_INVALID_STATE`) and received 
 | `0x0A` SET_KEY | `slot:u8 (0x2D), key[16]` | STATUS. Stored in flash (NVS), never sent back. `idf.py flash` leaves it; a release image written at 0x0 erases it |
 | `0x0B` KEY_STATUS | none | `0x88` KEY_INFO `{slot, present}` |
 | `0x0C` ERASE_KEYS | none | STATUS |
-| `0x10` GB_START | `flags:u8 (bit 0: log, bit 1: Pico), title[16] (cartridge header at 0x134), name[20] (UTF-16LE)` | STATUS: 0, `0x105` no key stored, `0x106` unknown game |
+| `0x10` GB_START | `flags:u8 (bit 0: log, bit 1: Pico, bit 2: detect the generation), title[16] (cartridge header at 0x134), name[20] (UTF-16LE)` | STATUS: 0, `0x105` no key stored, `0x106` unknown game |
 | `0x11` GB_XFER | `master:u8`, the byte the cartridge clocked out | `0x91` GB_REPLY `{slave:u8, wire phase:u8}`, the byte shifted back in the same transfer |
 | `0x12` GB_STOP | none | STATUS (STOP does the same while the wrapper runs) |
 | `0x13` GB_PICO | a frame of the GB-Link Pico's protocol, from the Pico (1.6) | none |
@@ -148,6 +148,27 @@ board speaks the Pico's own serial protocol (GB-Link GBLink-Firmware 2.2.7: `| 4
 until the Pico reports `0xFF0A`, SetTimingConfig with no wait of its own (`30 00 00 00 01`), then one byte to clock per data frame,
 the byte the Pico shifted in coming back. mGBA's Wireless Adapter > ESP32 stands in for the Pico over USB; a real Pico on the board's
 UART takes the same frames. Without the flag the cartridge is the master, as in 1.4 and 1.5.
+
+Firmware 1.7 makes the GB-Link model work with a **real cartridge**. The supported setup has no wires between the boards: a
+GB-Link (GBLink-Firmware 2.2.7 or later) and this board both plug into a PC's USB, and mGBA's `uds-gblink-relay` carries the Pico's
+frames between them, as GB-Link's own web page does for their firmware (the GB-Link's USB serial port speaks the same frames,
+vendor id 2FE3):
+
+```
+uds-gblink-relay [--esp32 COMx] [--gblink COMy] [--key <aes_keys.txt>] [--gen 1|2] [--name NAME] [--trace <file>]
+```
+
+Nobody can read the header of a cartridge in a Game Boy, so GB_START's bit 2 (with bit 1) has the board take the generation from
+the cartridge's first sync: the Cable Club receptionist syncs 60 in Gen 1 and 61 in Gen 2 (Time Capsule included), and a 70 or 80
+range is Gen 2's alone. The screen shows G? until then. mGBA sends the same flag with `MGBA_VCLINK_GEN=auto`, standing in for such a
+cartridge. Before Game Boy mode the board sends the Pico SetVoltage 5 V (`41`), as GB-Link's web page does for Gen 1 and 2 (an
+official GB-Link sets the link port's voltage in software; the DIY board's SW1 must be on 5 V). In idle, sync and menu the gap after
+each byte is what is left of a 12.6 ms period after the measured round trip, so a relay's milliseconds through the PC do not make
+the clock miss a frame.
+
+Optional, off by default (`idf.py menuconfig` > UDS bridge): a GB-Link wired to the board's UART with three wires, as GB-Link's
+firmware also allows (UART 1 at 921600, GPIO2 to the Pico's GP9 and GPIO1 from its GP8). With it, and no host on USB, the board asks
+the UART for Game Boy mode once a second and starts the wrapper on its own when a Pico answers; a host's HELLO takes the board back.
 
 While the wrapper runs the board also sends `0x90` GB_STATE `{room, session, wire phase, generation, channel}` on every change,
 `0x92` GB_STATS (10 × u32: beacons, frames sent and received, frames dropped for decryption, replay and other reasons, tx failures,

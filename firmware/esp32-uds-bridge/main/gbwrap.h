@@ -11,6 +11,12 @@
  *    coming back. mGBA's Wireless Adapter > ESP32 stands in for the Pico over USB.
  * The cartridge may be a real one behind an adapter or an emulator standing in for one.
  *
+ * Firmware 1.7 adds a real cartridge: GB_START's detect flag has the wrapper take the generation from the cartridge's first sync
+ * (nobody can read its header; uds-wire.h, udsWireSetGeneration 0). The supported setup is the GB-Link and this board both on a PC's
+ * USB, with mGBA's uds-gblink-relay carrying the Pico's frames between them in GB_PICO; mGBA can also stand in for such a cartridge
+ * (MGBA_VCLINK_GEN=auto). Optional and off by default (CONFIG_UDS_PICO_LINK): a GB-Link wired to the UART, with which the board
+ * starts on its own when there is no host; a host's HELLO takes the board back.
+ *
  * Everything between is the wrapper mGBA ran on the PC (src/gb/sio in the mgba_LDN repository), copied unchanged into gbwrap/: the
  * permanent slave (uds-wire.c, uds-cable.c), the Pia session (uds-session.c, uds-pia.c), the join (uds-room.c) and CCMP (uds-ccmp.c).
  * gbwrap.c holds what took the PC's place: the join on this board's radio and the task that runs it all. The 3DS key it needs is the
@@ -35,8 +41,12 @@ void gbwrap_init(gbwrap_send_t send);
 /* The command task hands these over; the wrapper task answers them (STATUS, or GB_REPLY for a transfer). */
 void gbwrap_request(uint8_t type, uint8_t seq, const uint8_t *payload, size_t length);
 
-/* True from GB_START until GB_STOP (or STOP): the radio belongs to the wrapper and its frames do not go to the host. */
+/* True from GB_START until GB_STOP (or STOP), or while the board runs on its own: the radio belongs to the wrapper and its frames do
+ * not go to the host. */
 bool gbwrap_active(void);
+
+/* The host said HELLO: from now on the host has the board. A wrapper the board started on its own stops. */
+void gbwrap_host_hello(void);
 
 /* From the Wi-Fi task: a received frame ({channel, rssi, flags, mpdu}, as UDS_EVT_RX). Only queues. */
 bool gbwrap_sink_rx(const uint8_t *payload, size_t length);

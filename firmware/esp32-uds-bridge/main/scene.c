@@ -137,19 +137,21 @@ static void count_text(char *out, size_t size, uint32_t value)
     else snprintf(out, size, "%luM", (unsigned long)(value / 1000000));
 }
 
-/* gen 0: the raw radio, a 3DS on each side; otherwise the wrapper's cartridge, its generation beside the channel. */
-static void draw_link(uint8_t *fb, const char *title, uint8_t gen, uint8_t channel, const char *line, uint32_t rx, uint32_t tx,
-                      uint32_t now)
+/* Without `cartridge` the raw radio, a 3DS on each side; with it the wrapper's cartridge, its generation beside the channel (0: not
+ * known yet, a cartridge behind a GB-Link that has not synced). */
+static void draw_link(uint8_t *fb, const char *title, bool cartridge, uint8_t gen, uint8_t channel, const char *line, uint32_t rx,
+                      uint32_t tx, uint32_t now)
 {
     char text[24];
     fb_print(fb, 0, 0, title, 1);
-    if (gen) snprintf(text, sizeof(text), "G%u ch%u", (unsigned)gen, (unsigned)channel);
+    if (cartridge && gen) snprintf(text, sizeof(text), "G%u ch%u", (unsigned)gen, (unsigned)channel);
+    else if (cartridge) snprintf(text, sizeof(text), "G? ch%u", (unsigned)channel);
     else snprintf(text, sizeof(text), "ch %u", (unsigned)channel);
     fb_print_right(fb, SCREEN_W, 0, text, 1);
     fb_hline(fb, 0, 9, SCREEN_W);
 
     draw_3ds(fb, 2, 13);
-    if (gen) draw_cartridge(fb, 104, 13);
+    if (cartridge) draw_cartridge(fb, 104, 13);
     else draw_3ds(fb, 102, 13);
     fb_hline(fb, CABLE_X0, CABLE_Y, CABLE_X1 - CABLE_X0);
     draw_balls(fb, now);
@@ -210,11 +212,10 @@ uint8_t scene_draw(uint8_t *fb, const scene_status_t *status, uint32_t now)
     fb_clear(fb);
     switch (status->mode) {
     case SCENE_RADIO:
-        draw_link(fb, "Azahar radio", 0, status->channel, "Radio running", status->rx, status->tx, now);
+        draw_link(fb, "Azahar radio", false, 0, status->channel, "Radio running", status->rx, status->tx, now);
         break;
     case SCENE_WRAPPER:
-        draw_link(fb, status->title, status->gen ? status->gen : 1, status->channel, stage_text(status->stage), status->rx,
-                  status->tx, now);
+        draw_link(fb, status->title, true, status->gen, status->channel, stage_text(status->stage), status->rx, status->tx, now);
         break;
     default:
         draw_idle(fb, status, now);

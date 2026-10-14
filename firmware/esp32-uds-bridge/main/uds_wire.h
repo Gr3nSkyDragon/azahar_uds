@@ -45,6 +45,7 @@
 #define UDS_CMD_GB_PICO 0x13    /* {Pico frame}: from the Pico (data: the bytes it shifted in; status) */
 #define UDS_GB_START_LOG 0x01
 #define UDS_GB_START_PICO 0x02
+#define UDS_GB_START_DETECT 0x04 /* 1.7 on, with PICO: the title is not used; the cartridge's first sync tells its generation */
 
 /* Device -> host. */
 #define UDS_EVT_HELLO_ACK 0x81 /* {proto:u8, fw_major:u8, fw_minor:u8, factory_mac[6]} */
