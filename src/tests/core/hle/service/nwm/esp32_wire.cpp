@@ -28,7 +28,7 @@ std::vector<Esp32::Frame> Decode(Esp32::Decoder& decoder, const std::vector<u8>&
 
 } // namespace
 
-// Golden vectors shared with firmware/esp32-uds-bridge/test/wire_test.c (produced by an
+// Golden vectors shared with VC-Adapter's firmware/esp32-uds-bridge/test/wire_test.c (produced by an
 // independent Python implementation of the same framing).
 TEST_CASE("ESP32 wire: golden frames", "[core][nwm]") {
     const std::vector<u8> start_payload{6, 0x00, 0x1F, 0x32, 0xAA, 0x00, 0x01};

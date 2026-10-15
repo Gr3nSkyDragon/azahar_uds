@@ -7,7 +7,7 @@
 
 // The "UDS Real" physical backend bridges nwm::UDS to a real 802.11 radio. Two radios exist:
 //  - a USB Wi-Fi adapter driven through ldnd.exe (Windows only, the default there), and
-//  - an ESP32-S3 running firmware/esp32-uds-bridge over USB, selected by the use_esp32_uds setting.
+//  - an ESP32-S3 running VC-Adapter's firmware/esp32-uds-bridge over USB, selected by the use_esp32_uds setting.
 // Android has only the ESP32. On Windows the ESP32 is chosen in Configure > General > Network.
 // Other platforms have no backend.
 #if defined(_WIN32) || defined(ANDROID)

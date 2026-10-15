@@ -16,7 +16,7 @@
 namespace Service::NWM::UdsReal::Esp32 {
 
 // Serial framing between Azahar (Android) and the ESP32-S3 UDS radio firmware
-// (firmware/esp32-uds-bridge). The device is a dumb 802.11 radio: it captures and injects raw
+// (VC-Adapter's firmware/esp32-uds-bridge). The device is a dumb 802.11 radio: it captures and injects raw
 // MPDUs and hardware-ACKs frames addressed to the MAC it was started with. All UDS logic, CCMP
 // and the connection handshake stay in nwm::UDS.
 //
@@ -24,7 +24,7 @@ namespace Service::NWM::UdsReal::Esp32 {
 //
 // The CRC is CRC-32/ISO-HDLC (zlib) over everything before it. The raw frame is COBS encoded and
 // terminated by one 0x00 byte. The C implementation of the same framing lives in
-// firmware/esp32-uds-bridge/main/uds_wire.c; keep the two in step (see the wire test).
+// VC-Adapter's firmware/esp32-uds-bridge/main/uds_wire.c; keep the two in step (see the wire test).
 
 constexpr u8 WireVersion = 1;
 constexpr std::size_t WireHeaderSize = 6;

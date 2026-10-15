@@ -22,7 +22,7 @@ import java.util.concurrent.TimeUnit
 import org.citra.citra_emu.CitraApplication
 
 /**
- * CDC-ACM serial link to the ESP32-S3 running firmware/esp32-uds-bridge (its native USB
+ * CDC-ACM serial link to the ESP32-S3 running VC-Adapter's firmware/esp32-uds-bridge (its native USB
  * Serial/JTAG port). The core's monitor thread reaches [open], [read] and [write] through JNI
  * (jni/esp32_usb_serial.cpp); the rest of the app only calls [install] and [ensurePermission].
  */

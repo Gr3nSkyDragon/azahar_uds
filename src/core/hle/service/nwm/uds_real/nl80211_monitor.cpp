@@ -2623,7 +2623,7 @@ std::vector<u8> AddRadiotapHeader(std::span<const u8> frame, bool no_ack) {
 
 // ---------------------------------------------------------------------------------------------
 // ESP32 radio backend (Android). Same job as RunMonitorBody, but the radio is an ESP32-S3 running
-// firmware/esp32-uds-bridge, reached over a USB serial port. The device does raw capture/inject,
+// VC-Adapter's firmware/esp32-uds-bridge, reached over a USB serial port. The device does raw capture/inject,
 // periodic beacon transmission and hardware ACKs for the MAC it was started with; discovery,
 // channel policy and everything above the MPDU stay here so both backends behave alike.
 // ---------------------------------------------------------------------------------------------
