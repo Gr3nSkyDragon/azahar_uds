@@ -156,6 +156,10 @@ else()
     target_compile_definitions(microprofile INTERFACE MICROPROFILE_ENABLED=0)
 endif()
 
+# microtar
+add_library(microtar STATIC ./microtar/src/microtar.c)
+target_include_directories(microtar PUBLIC ./microtar/src)
+
 # Nihstro
 add_library(nihstro-headers INTERFACE)
 target_include_directories(nihstro-headers INTERFACE ./nihstro/include)
@@ -388,7 +392,7 @@ if (ENABLE_OPENAL)
         if (BSD STREQUAL "OpenBSD")
             set(ALSOFT_BACKEND_SOLARIS OFF CACHE BOOL "")
         endif()
-        set(ALSOFT_EMBED_HRTF_DATA OFF CACHE BOOL "")
+        set(ALSOFT_EMBED_HRTF_DATA ON CACHE BOOL "")
         set(ALSOFT_EXAMPLES OFF CACHE BOOL "")
         set(ALSOFT_INSTALL OFF CACHE BOOL "")
         set(ALSOFT_INSTALL_CONFIG OFF CACHE BOOL "")
