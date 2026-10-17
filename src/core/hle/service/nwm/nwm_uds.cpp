@@ -441,6 +441,12 @@ void NWM_UDS::HandleEAPoLPacket(const Network::WifiPacket& packet) {
                      network_info.total_nodes, network_info.max_nodes);
 
             BroadcastNodeMap();
+
+            // The radio's beacon must list the new node before the station acts on its accept: a
+            // retail console reads our next beacon right after it, and one that still shows only
+            // the host (up to a beacon interval old) makes it leave again (deauthentication reason
+            // 3, 30-110 ms after the accept).
+            SubmitPhysicalBeacon(GenerateBeaconFrame(network_info, node_info));
         } else if (wire_connection_type == static_cast<u16>(ConnectionType::Spectator)) {
             node_map[packet.transmitter_address].node_id = NodeIDSpec;
             node_map[packet.transmitter_address].connected = true;
@@ -940,6 +946,9 @@ void NWM_UDS::HandleDeauthenticationFrame(const Network::WifiPacket& packet) {
         // TODO(B3N30): broadcast new connection_status to clients
     }
     node_it->Reset();
+    if (!node.spec) {
+        SubmitPhysicalBeacon(GenerateBeaconFrame(network_info, node_info));
+    }
     SignalEventAsync(connection_status_event);
 }
 
@@ -3110,14 +3119,7 @@ void NWM_UDS::BeaconBroadcastCallback(std::uintptr_t user_data, s64 cycles_late)
 
     std::vector<u8> frame = GenerateBeaconFrame(network_info, node_info);
 
-    bool physical_beacon_queued = false;
-#if UDS_REAL_BACKEND
-    if (real_monitor && real_monitor->IsRunning()) {
-        real_monitor->SubmitBeacon(std::span<const u8>{frame.data(), frame.size()},
-                                   network_info.host_mac_address);
-        physical_beacon_queued = true;
-    }
-#endif
+    const bool physical_beacon_queued = SubmitPhysicalBeacon(frame);
 
     ++beacon_broadcast_callback_count;
     if (beacon_broadcast_callback_count <= 5 || beacon_broadcast_callback_count % 100 == 0) {
@@ -3149,6 +3151,17 @@ void NWM_UDS::BeaconBroadcastCallback(std::uintptr_t user_data, s64 cycles_late)
     system.CoreTiming().ScheduleEvent(msToCycles(DefaultBeaconInterval * MillisecondsPerTU) -
                                           cycles_late,
                                       beacon_broadcast_event, 0);
+}
+
+bool NWM_UDS::SubmitPhysicalBeacon(const std::vector<u8>& frame) {
+#if UDS_REAL_BACKEND
+    if (real_monitor && real_monitor->IsRunning()) {
+        real_monitor->SubmitBeacon(std::span<const u8>{frame.data(), frame.size()},
+                                   network_info.host_mac_address);
+        return true;
+    }
+#endif
+    return false;
 }
 
 Network::MacAddress NWM_UDS::GetMacAddress() {

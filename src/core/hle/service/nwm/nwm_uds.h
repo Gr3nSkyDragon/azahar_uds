@@ -542,6 +542,9 @@ private:
     Network::MacAddress GetMacAddress();
 
     void BeaconBroadcastCallback(std::uintptr_t user_data, s64 cycles_late);
+    /// Hands the radio a beacon for the network as it is now, without waiting for the next beacon
+    /// interval. Returns whether the radio took it.
+    bool SubmitPhysicalBeacon(const std::vector<u8>& frame);
     void ClientKeepaliveCallback(std::uintptr_t user_data, s64 cycles_late);
     void MonitorLingerCallback(std::uintptr_t user_data, s64 cycles_late);
 

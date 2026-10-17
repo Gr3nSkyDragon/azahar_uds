@@ -111,6 +111,9 @@ constexpr char MonitorName[] = "udsmon0";
 constexpr char AccessPointName[] = "udsap0";
 constexpr std::chrono::milliseconds DiscoveryChannelDwell{250};
 constexpr std::chrono::seconds DiscoveryChannelHold{30};
+// How long a station's authentication, association or data in our network keeps the ESP32 radio
+// where it is while hosting, instead of tuning it to the hosted channel.
+constexpr std::chrono::seconds HostedStationHold{5};
 constexpr std::chrono::seconds ActiveProbeInterval{1};
 constexpr std::chrono::milliseconds PhysicalBeaconInterval{102};
 constexpr std::array<u16, 3> PrimaryDiscoveryChannels{1, 6, 11};
@@ -2315,7 +2318,10 @@ std::vector<u8> AddRadiotapHeader(std::span<const u8> frame, bool no_ack) {
             }
 
             const auto now = std::chrono::steady_clock::now();
-            if (now >= next_physical_beacon) {
+            // While the kernel AP sends the beacons, poll every pass: a join or leave changes the
+            // beacon, and a console reads the next one right after its join is accepted. Only a
+            // changed body reaches the kernel, so polling costs nothing on the air.
+            if (now >= next_physical_beacon || access_point_started) {
                 auto pending_beacon = physical_beacon_provider();
                 if (pending_beacon && pending_beacon->ack_shell_only) {
                     // Client-role ACK shell: keep it only for the AP start, never transmit it.
@@ -2829,9 +2835,9 @@ void RunEsp32Body(std::atomic<bool>& stop_requested, std::atomic<u16>& selected_
     u16 transmitted_probe_sequence = 0;
     auto last_nintendo_beacon = Clock::time_point{};
     auto last_active_peer_frame = Clock::time_point{};
+    auto last_hosted_station_frame = Clock::time_point{};
     auto next_channel_hop = Clock::now() + DiscoveryChannelDwell;
     auto next_active_probe = Clock::now();
-    auto next_beacon_poll = Clock::now();
     auto next_ping = Clock::now();
     std::size_t delivered_beacon_count = 0;
     std::size_t delivered_frame_count = 0;
@@ -3036,6 +3042,14 @@ void RunEsp32Body(std::atomic<bool>& stop_requested, std::atomic<u16>& selected_
                 continue;
             }
             last_active_peer_frame = Clock::now();
+            // A station joining or in our network (not the deauthentications a retail console
+            // sends us while it searches).
+            if (uses_local_bssid &&
+                (frame->type == 2 ||
+                 (frame->type == 0 &&
+                  (frame->subtype == 0 || frame->subtype == 2 || frame->subtype == 11)))) {
+                last_hosted_station_frame = last_active_peer_frame;
+            }
             if (!have_active_peer) {
                 LOG_INFO(Service_NWM,
                          "UDS Real ESP32: active peer traffic found; locking radio to channel {}",
@@ -3063,9 +3077,10 @@ void RunEsp32Body(std::atomic<bool>& stop_requested, std::atomic<u16>& selected_
         const auto now = Clock::now();
 
         // Keep the device's beacon template current. It transmits it at the beacon interval on
-        // its own, so a slow USB round trip never shows up as a missing beacon.
-        if (now >= next_beacon_poll) {
-            next_beacon_poll = now + std::chrono::milliseconds(50);
+        // its own, so a slow USB round trip never shows up as a missing beacon. Polled every pass
+        // (a few milliseconds): a join changes the beacon, and the console that joined reads the
+        // next one right after its accept. Only a changed template goes over USB.
+        {
             auto pending_beacon = physical_beacon_provider();
             if (pending_beacon && pending_beacon->ack_shell_only) {
                 // Client role: the desktop backend needs a hidden beacon to bring up its ACK shell;
@@ -3131,6 +3146,23 @@ void RunEsp32Body(std::atomic<bool>& stop_requested, std::atomic<u16>& selected_
             payload.insert(payload.end(), probe.begin(), probe.end());
             session.Send(Esp32::Type::TxFrame, payload);
             next_active_probe = now + ActiveProbeInterval;
+        }
+
+        // A hosted network stays on its own channel, as a retail host does (the desktop monitor's
+        // rule). Otherwise the radio stays on whichever channel the retail's search locked it to
+        // and advertises that one instead. Only a station already joining us holds the radio; the
+        // retail's search traffic keeps the peer "recent" for DiscoveryChannelHold and must not.
+        if (latest_physical_beacon) {
+            const u8 hosted_channel = BeaconDsChannel(latest_physical_beacon->body);
+            const bool station_is_recent = now - last_hosted_station_frame < HostedStationHold;
+            if (hosted_channel != 0 && hosted_channel != current_channel && !station_is_recent) {
+                LOG_INFO(Service_NWM,
+                         "UDS Real ESP32: hosting; tuned from channel {} to the network channel "
+                         "{} and stopped hopping",
+                         current_channel, hosted_channel);
+                set_channel(hosted_channel); // The next pass re-sends the beacon for this channel.
+            }
+            continue;
         }
 
         if (now < next_channel_hop || beacon_is_recent || peer_is_recent) {
