@@ -111,6 +111,10 @@ constexpr char MonitorName[] = "udsmon0";
 constexpr char AccessPointName[] = "udsap0";
 constexpr std::chrono::milliseconds DiscoveryChannelDwell{250};
 constexpr std::chrono::seconds DiscoveryChannelHold{30};
+// How long a hosting radio keeps following a retail console after its last beacon. A console
+// beacons about ten times a second, so a gap this long means it has moved: to its trade network on
+// another channel, typically. DiscoveryChannelHold kept the radio on the old channel for 30 s.
+constexpr std::chrono::seconds ConsoleFollowHold{2};
 // How long a station's authentication, association or data in our network keeps the ESP32 radio
 // where it is while hosting, instead of tuning it to the hosted channel.
 constexpr std::chrono::seconds HostedStationHold{5};
@@ -2479,10 +2483,15 @@ std::vector<u8> AddRadiotapHeader(std::span<const u8> frame, bool no_ack) {
             }
             // A hosted network stays on its own channel, as a retail host does. Hopping would put
             // the beacons on channels 1, 6 and 11 in turn, each advertising a different channel.
+            // A retail console heard on another channel keeps the radio with it, though: a game in
+            // the PSS or the Festival Plaza listens on its own channel, and a radio tuned away
+            // missed its trade request (or its answer to ours) until the beacon timed out.
             if (latest_physical_beacon && !latest_physical_beacon->ack_shell_only) {
                 const u8 hosted_channel = BeaconDsChannel(latest_physical_beacon->body);
+                const bool console_is_here = have_recent_nintendo_beacon &&
+                                             now - last_nintendo_beacon < ConsoleFollowHold;
                 if (hosted_channel != 0 && hosted_channel != current_channel && !peer_is_recent &&
-                    !access_point_started && now >= next_channel_hop) {
+                    !console_is_here && !access_point_started && now >= next_channel_hop) {
                     try {
                         SetChannel(connection, generic_socket_id, port_id, family_id,
                                    monitor_ifindex, ChannelToFrequency(hosted_channel), sequence);
@@ -3148,19 +3157,20 @@ void RunEsp32Body(std::atomic<bool>& stop_requested, std::atomic<u16>& selected_
             next_active_probe = now + ActiveProbeInterval;
         }
 
-        // A hosted network stays on its own channel, as a retail host does (the desktop monitor's
-        // rule). Otherwise the radio stays on whichever channel the retail's search locked it to
-        // and advertises that one instead. Only a station already joining us holds the radio; the
-        // retail's search traffic keeps the peer "recent" for DiscoveryChannelHold and must not.
+        // While hosting, a station joining or using the network holds the radio where it is. Until
+        // one does, the radio follows the retail console it hears: a game in the PSS or the
+        // Festival Plaza advertises and listens on its own channel, so a radio parked on the hosted
+        // channel missed the console's trade request (or its answer to ours) until the beacon
+        // timed out after DiscoveryChannelHold. With no console heard it keeps hopping to find one.
+        // The beacon follows the radio: the next pass re-sends it for the current channel.
         if (latest_physical_beacon) {
-            const u8 hosted_channel = BeaconDsChannel(latest_physical_beacon->body);
             const bool station_is_recent = now - last_hosted_station_frame < HostedStationHold;
-            if (hosted_channel != 0 && hosted_channel != current_channel && !station_is_recent) {
-                LOG_INFO(Service_NWM,
-                         "UDS Real ESP32: hosting; tuned from channel {} to the network channel "
-                         "{} and stopped hopping",
-                         current_channel, hosted_channel);
-                set_channel(hosted_channel); // The next pass re-sends the beacon for this channel.
+            const bool console_is_here =
+                have_recent_nintendo_beacon && now - last_nintendo_beacon < ConsoleFollowHold;
+            if (!station_is_recent && !console_is_here && now >= next_channel_hop) {
+                channel_index = (channel_index + 1) % discovery_channels.size();
+                set_channel(discovery_channels[channel_index]);
+                next_channel_hop = Clock::now() + DiscoveryChannelDwell;
             }
             continue;
         }
