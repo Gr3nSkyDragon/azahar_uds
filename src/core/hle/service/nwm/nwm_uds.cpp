@@ -2249,14 +2249,16 @@ Result NWM_UDS::BeginHostingNetwork(std::span<const u8> network_info_buffer,
     LOG_INFO(Service_NWM,
              "UDS Real: BeginHostingNetwork #{}, hostMac={:02X}:{:02X}:{:02X}:{:02X}:"
              "{:02X}:{:02X}, wlanCommId=0x{:08X}, id={}, networkId=0x{:08X}, channel={}, "
-             "maxNodes={}, applicationDataSize={}, applicationFingerprint=0x{:08X}; "
-             "Azahar beacon generation scheduled",
+             "maxNodes={}, applicationDataSize={}, applicationFingerprint=0x{:08X}, "
+             "applicationData={}; Azahar beacon generation scheduled",
              begin_hosting_request_count, network_info.host_mac_address[0],
              network_info.host_mac_address[1], network_info.host_mac_address[2],
              network_info.host_mac_address[3], network_info.host_mac_address[4],
              network_info.host_mac_address[5], static_cast<u32>(network_info.wlan_comm_id),
              network_info.id, static_cast<u32>(network_info.network_id), network_channel,
-             network_info.max_nodes, application_data_size, application_fingerprint);
+             network_info.max_nodes, application_data_size, application_fingerprint,
+             FormatHexBytes(std::span<const u8>{network_info.application_data.data(),
+                                                application_data_size}));
 
 #if UDS_REAL_BACKEND
     if (real_monitor && physical_data_ccmp_key) {
@@ -2908,6 +2910,8 @@ void NWM_UDS::SetApplicationData(Kernel::HLERequestContext& ctx) {
 
     network_info.application_data_size = static_cast<u8>(size);
     std::memcpy(network_info.application_data.data(), application_data.data(), size);
+    LOG_INFO(Service_NWM, "UDS Real: SetApplicationData size={}, applicationData={}", size,
+             FormatHexBytes(std::span<const u8>{application_data.data(), size}));
 
     rb.Push(ResultSuccess);
 }
@@ -3045,13 +3049,16 @@ void NWM_UDS::DecryptBeaconData(Kernel::HLERequestContext& ctx) {
         LOG_INFO(Service_NWM,
                  "UDS Real: retail beacon payload #{}, changed={}, applicationDataSize={}, "
                  "applicationFingerprint=0x{:08X}, nodeDataFingerprint=0x{:08X}, "
-                 "firstNodeId={}, firstNodeUsernameFingerprint=0x{:08X}, totalDecodedNodes={}",
+                 "firstNodeId={}, firstNodeUsernameFingerprint=0x{:08X}, totalDecodedNodes={}, "
+                 "applicationData={}",
                  beacon_decrypt_request_count, payload_changed, application_data_size,
                  application_fingerprint,
                  FingerprintBytes(std::span<const u8>{beacon_header.md5_hash.data(),
                                                       beacon_header.md5_hash.size()}),
                  first_node ? static_cast<u16>(first_node->network_node_id) : 0,
-                 first_node ? FingerprintUsername(*first_node) : 0, nodes.size());
+                 first_node ? FingerprintUsername(*first_node) : 0, nodes.size(),
+                 FormatHexBytes(std::span<const u8>{net_info.application_data.data(),
+                                                    application_data_size}));
     }
     have_beacon_payload_fingerprint = true;
     last_beacon_application_fingerprint = application_fingerprint;
