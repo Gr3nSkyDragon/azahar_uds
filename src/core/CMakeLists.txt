@@ -219,6 +219,8 @@ add_library(citra_core STATIC EXCLUDE_FROM_ALL
     hle/service/am/am_sys.h
     hle/service/am/am_u.cpp
     hle/service/am/am_u.h
+    hle/service/am/trust_chain.cpp
+    hle/service/am/trust_chain.h
     hle/service/apt/applet_manager.cpp
     hle/service/apt/applet_manager.h
     hle/service/apt/apt.cpp
@@ -525,7 +527,7 @@ endif()
 
 create_target_directory_groups(citra_core)
 
-target_link_libraries(citra_core PUBLIC citra_common PRIVATE audio_core network video_core)
+target_link_libraries(citra_core PUBLIC citra_common PRIVATE audio_core network video_core input_common)
 target_link_libraries(citra_core PRIVATE Boost::boost Boost::serialization Boost::iostreams httplib)
 if (WIN32)
     # Finding the ESP32's COM port (hle/service/nwm/uds_real/esp32_serial.cpp).

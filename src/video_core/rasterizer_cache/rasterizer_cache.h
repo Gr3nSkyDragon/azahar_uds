@@ -1,6 +1,6 @@
 // Copyright 2015-2026 Citra Emulator Project / Azahar Emulator Project
-// Licensed under GPLv2 or any later version
-// Refer to the misc/licenses/gplv2.txt file included.
+// Licensed under GPLv3 or any later version
+// Refer to the LICENSE.txt file included.
 
 #pragma once
 
@@ -38,7 +38,7 @@ RasterizerCache<T>::RasterizerCache(Memory::MemorySystem& memory_,
                                     Pica::RegsInternal& regs_, RendererBase& renderer_)
     : memory{memory_}, custom_tex_manager{custom_tex_manager_}, runtime{runtime_}, regs{regs_},
       renderer{renderer_}, resolution_scale_factor{renderer.GetResolutionScaleFactor()},
-      filter{Settings::values.texture_filter.GetValue()},
+      sample_count{renderer.GetSampleCount()}, filter{Settings::values.texture_filter.GetValue()},
       dump_textures{Settings::values.dump_textures.GetValue()},
       use_custom_textures{Settings::values.custom_textures.GetValue()} {
     using TextureConfig = Pica::TexturingRegs::TextureConfig;
@@ -112,12 +112,15 @@ void RasterizerCache<T>::TickFrame() {
     }
 
     const u32 scale_factor = renderer.GetResolutionScaleFactor();
+    const u32 samples = renderer.GetSampleCount();
     const bool resolution_scale_changed = resolution_scale_factor != scale_factor;
+    const bool sample_count_changed = sample_count != samples;
     const bool use_custom_texture_changed =
         Settings::values.custom_textures.GetValue() != use_custom_textures;
 
-    if (resolution_scale_changed || use_custom_texture_changed) {
+    if (resolution_scale_changed || use_custom_texture_changed || sample_count_changed) {
         resolution_scale_factor = scale_factor;
+        sample_count = renderer.GetSampleCount();
         use_custom_textures = Settings::values.custom_textures.GetValue();
         if (use_custom_textures) {
             custom_tex_manager.FindCustomTextures();
@@ -307,6 +310,7 @@ bool RasterizerCache<T>::AccelerateDisplayTransfer(const Pica::DisplayTransferCo
                                                          : config.output_height.Value();
     dst_params.is_tiled = config.input_linear != config.dont_swizzle;
     dst_params.pixel_format = PixelFormatFromGPUPixelFormat(config.output_format);
+    dst_params.sample_count = sample_count;
     dst_params.UpdateParams();
 
     // Using flip_vertically alongside crop_input_lines produces skewed output on hardware.
@@ -322,6 +326,7 @@ bool RasterizerCache<T>::AccelerateDisplayTransfer(const Pica::DisplayTransferCo
     }
 
     dst_params.res_scale = slot_surfaces[src_surface_id].res_scale;
+    dst_params.sample_count = slot_surfaces[src_surface_id].sample_count;
 
     const auto [dst_surface_id, dst_rect] =
         GetSurfaceSubRect(dst_params, ScaleMatch::Upscale, false);
@@ -452,8 +457,10 @@ void RasterizerCache<T>::CopySurface(Surface& src_surface, Surface& dst_surface,
 
     const u32 src_scale = src_surface.res_scale;
     const u32 dst_scale = dst_surface.res_scale;
-    if (src_scale > dst_scale) {
-        dst_surface.ScaleUp(src_scale);
+    const u32 src_sample_count = src_surface.sample_count;
+    const u32 dst_sample_count = dst_surface.sample_count;
+    if ((src_scale > dst_scale) || (src_sample_count > dst_sample_count)) {
+        dst_surface.ScaleUp(src_scale, src_sample_count);
     }
 
     const auto src_rect = src_surface.GetScaledSubRect(subrect_params);
@@ -522,6 +529,7 @@ typename RasterizerCache<T>::SurfaceRect_Tuple RasterizerCache<T>::GetSurfaceSub
         if (surface_id) {
             SurfaceParams new_params = slot_surfaces[surface_id];
             new_params.res_scale = params.res_scale;
+            new_params.sample_count = params.sample_count;
 
             surface_id = CreateSurface(new_params, create_initial_flags);
             RegisterSurface(surface_id);
@@ -598,10 +606,11 @@ SurfaceId RasterizerCache<T>::GetTextureSurface(const Pica::Texture::TextureInfo
         }
         const auto [src_surface_id, rect] =
             GetSurfaceSubRect(params, ScaleMatch::Ignore, true, initial_flags);
-        Surface& src_surface = slot_surfaces[src_surface_id];
 
-        params.res_scale = src_surface.res_scale;
+        // CreateSurface can grow slot_surfaces, so take Surface& after it returns
+        params.res_scale = slot_surfaces[src_surface_id].res_scale;
         SurfaceId tmp_surface_id = CreateSurface(params, initial_flags);
+        Surface& src_surface = slot_surfaces[src_surface_id];
         Surface& tmp_surface = slot_surfaces[tmp_surface_id];
         sentenced.emplace_back(tmp_surface_id, runtime.GetResourceTick());
 
@@ -726,6 +735,7 @@ FramebufferHelper<T> RasterizerCache<T>::GetFramebufferSurfaces(bool using_color
     SurfaceParams color_params;
     color_params.is_tiled = true;
     color_params.res_scale = resolution_scale_factor;
+    color_params.sample_count = sample_count;
     color_params.width = config.GetWidth();
     color_params.height = config.GetHeight();
     SurfaceParams depth_params = color_params;
@@ -769,18 +779,19 @@ FramebufferHelper<T> RasterizerCache<T>::GetFramebufferSurfaces(bool using_color
         fb_rect = depth_rect;
     }
 
-    Surface* color_surface = color_id ? &slot_surfaces[color_id] : nullptr;
-    Surface* depth_surface = depth_id ? &slot_surfaces[depth_id] : nullptr;
-
     if (color_id) {
-        color_level = color_surface->LevelOf(color_params.addr);
-        color_surface->flags |= SurfaceFlagBits::RenderTarget;
+        // Validation can grow slot_surfaces, reference lifetime should expire after validation
+        Surface& color_surface = slot_surfaces[color_id];
+        color_level = color_surface.LevelOf(color_params.addr);
+        color_surface.flags |= SurfaceFlagBits::RenderTarget;
         ValidateSurface(color_id, boost::icl::first(color_vp_interval),
                         boost::icl::length(color_vp_interval));
     }
     if (depth_id) {
-        depth_level = depth_surface->LevelOf(depth_params.addr);
-        depth_surface->flags |= SurfaceFlagBits::RenderTarget;
+        // Validation can grow slot_surfaces, reference lifetime should expire after validation
+        Surface& depth_surface = slot_surfaces[depth_id];
+        depth_level = depth_surface.LevelOf(depth_params.addr);
+        depth_surface.flags |= SurfaceFlagBits::RenderTarget;
         ValidateSurface(depth_id, boost::icl::first(depth_vp_interval),
                         boost::icl::length(depth_vp_interval));
     }
@@ -795,6 +806,9 @@ FramebufferHelper<T> RasterizerCache<T>::GetFramebufferSurfaces(bool using_color
 
     auto [it, new_framebuffer] = framebuffers.try_emplace(fb_params);
     if (new_framebuffer) {
+        // Validation can grow slot_surfaces, so get fresh references here
+        Surface* color_surface = color_id ? &slot_surfaces[color_id] : nullptr;
+        Surface* depth_surface = depth_id ? &slot_surfaces[depth_id] : nullptr;
         it->second = slot_framebuffers.insert(runtime, fb_params, color_surface, depth_surface);
     }
 
@@ -881,12 +895,16 @@ SurfaceId RasterizerCache<T>::FindMatch(const SurfaceParams& params, ScaleMatch 
     SurfaceId match_id{};
     bool match_valid = false;
     u32 match_scale = 0;
+    u8 match_sample_count = 0;
     SurfaceInterval match_interval{};
 
     ForEachSurfaceInRegion(params.addr, params.size, [&](SurfaceId surface_id, Surface& surface) {
         const bool res_scale_matched = match_scale_type == ScaleMatch::Exact
                                            ? (params.res_scale == surface.res_scale)
                                            : (params.res_scale <= surface.res_scale);
+        const bool sample_count_matched = match_scale_type == ScaleMatch::Exact
+                                              ? (params.sample_count == surface.sample_count)
+                                              : (params.sample_count <= surface.sample_count);
         const bool is_valid =
             True(find_flags & MatchFlags::Copy)
                 ? true
@@ -906,11 +924,16 @@ SurfaceId RasterizerCache<T>::FindMatch(const SurfaceParams& params, ScaleMatch 
                 surface.type != SurfaceType::Fill)
                 return;
 
+            if (!sample_count_matched && match_scale_type != ScaleMatch::Ignore &&
+                surface.type != SurfaceType::Fill)
+                return;
+
             // Found a match, update only if this is better than the previous one
             auto UpdateMatch = [&] {
                 match_id = surface_id;
                 match_valid = is_valid;
                 match_scale = surface.res_scale;
+                match_sample_count = surface.sample_count;
                 match_interval = surface_interval;
             };
 
@@ -918,6 +941,13 @@ SurfaceId RasterizerCache<T>::FindMatch(const SurfaceParams& params, ScaleMatch 
                 UpdateMatch();
                 return;
             } else if (surface.res_scale < match_scale) {
+                return;
+            }
+
+            if (surface.sample_count > match_sample_count) {
+                UpdateMatch();
+                return;
+            } else if (surface.sample_count < match_sample_count) {
                 return;
             }
 
@@ -967,23 +997,29 @@ void RasterizerCache<T>::ValidateSurface(SurfaceId surface_id, PAddr addr, u32 s
         return;
     }
 
-    Surface& surface = slot_surfaces[surface_id];
     const SurfaceInterval validate_interval(addr, addr + size);
+    SurfaceRegions validate_regions;
+    u32 level = 0;
+    SurfaceInterval level_interval{};
+    {
+        // Keep this reference out of the loop. A custom upload below can grow slot_surfaces
+        Surface& surface = slot_surfaces[surface_id];
+        if (surface.type == SurfaceType::Fill) {
+            ASSERT_MSG(surface.IsRegionValid(validate_interval),
+                       "Attempted to validate a non-valid fill surface");
+            return;
+        }
 
-    if (surface.type == SurfaceType::Fill) {
-        ASSERT_MSG(surface.IsRegionValid(validate_interval),
-                   "Attempted to validate a non-valid fill surface");
-        return;
-    }
-
-    SurfaceRegions validate_regions = surface.invalid_regions & validate_interval;
-
-    if (validate_regions.empty()) {
-        return;
+        validate_regions = surface.invalid_regions & validate_interval;
+        if (validate_regions.empty()) {
+            return;
+        }
+        level = surface.LevelOf(addr);
+        level_interval = surface.LevelInterval(level);
     }
 
     auto notify_validated = [&](SurfaceInterval interval) {
-        surface.MarkValid(interval);
+        slot_surfaces[surface_id].MarkValid(interval);
         validate_regions.erase(interval);
     };
 
@@ -991,9 +1027,10 @@ void RasterizerCache<T>::ValidateSurface(SurfaceId surface_id, PAddr addr, u32 s
                            "RasterizerCache::ValidateSurface (from {:#x} to {:#x})", addr,
                            addr + size};
 
-    u32 level = surface.LevelOf(addr);
-    SurfaceInterval level_interval = surface.LevelInterval(level);
     while (!validate_regions.empty()) {
+        // A synchronous custom upload can grow slot_surfaces and invalidate Surface&
+        Surface& surface = slot_surfaces[surface_id];
+
         // Take an invalid interval from the validation regions and clamp it
         // to the current level interval. If the interval is empty
         // then we have validated the entire level so move to the next.
@@ -1024,13 +1061,14 @@ void RasterizerCache<T>::ValidateSurface(SurfaceId surface_id, PAddr addr, u32 s
 
         FlushRegion(params.addr, params.size);
         if (!use_custom_textures || !UploadCustomSurface(surface_id, interval)) {
-            UploadSurface(surface, interval);
+            UploadSurface(slot_surfaces[surface_id], interval);
         }
         notify_validated(params.GetInterval());
     }
 
     // Filtered mipmaps often look really bad. We can achieve better quality by
     // generating them from the base level.
+    Surface& surface = slot_surfaces[surface_id];
     if (surface.res_scale != 1 && level != 0) {
         runtime.GenerateMipmaps(surface);
     }
@@ -1113,22 +1151,88 @@ bool RasterizerCache<T>::UploadCustomSurface(SurfaceId surface_id, SurfaceInterv
         return true;
     }
 
+    // Dump skips a surface that already has this flag, so set it before that upload
     surface.flags |= SurfaceFlagBits::Custom;
 
-    const auto upload = [this, level, surface_id, material]() -> bool {
-        ASSERT_MSG(True(slot_surfaces[surface_id].flags & SurfaceFlagBits::Custom),
-                   "Surface is not suitable for custom upload, aborting!");
-        if (!slot_surfaces[surface_id].IsCustom()) {
-            const SurfaceBase old_surface{slot_surfaces[surface_id]};
+    // Decode finishes on a later frame, so the callback checks the slot again before uploading
+    const SurfaceParams expected_surface = surface;
+
+    const auto upload = [this, level, surface_id, material, expected_surface, load_info,
+                         hash]() -> bool {
+        if (!slot_surfaces.contains(surface_id)) {
+            return false;
+        }
+
+        // A live slot may now hold another texture, or this one may have been unregistered.
+        // custom_format is left out of the compare because this upload is what sets it
+        Surface& target = slot_surfaces[surface_id];
+        const bool same_guest =
+            target.addr == expected_surface.addr && target.end == expected_surface.end &&
+            target.width == expected_surface.width && target.height == expected_surface.height &&
+            target.stride == expected_surface.stride && target.levels == expected_surface.levels &&
+            target.is_tiled == expected_surface.is_tiled &&
+            target.texture_type == expected_surface.texture_type &&
+            target.pixel_format == expected_surface.pixel_format;
+        if (False(target.flags & SurfaceFlagBits::Registered) || !same_guest ||
+            !runtime.SupportsCustomFormat(material->format)) {
+            return false;
+        }
+
+        // Guest pixels can change without a new surface. Drop the material when they no longer
+        // match the hash captured at queue time
+        MemoryRef source_ptr = memory.GetPhysicalRef(load_info.addr);
+        if (!source_ptr) {
+            return false;
+        }
+        const auto upload_data = source_ptr.GetWriteBytes(load_info.end - load_info.addr);
+        if (ComputeHash(load_info, upload_data) != hash) {
+            return false;
+        }
+
+        // Each mip is its own material and only the base material may allocate the image. A mip
+        // that arrives first would size that image to the mip
+        if (level != 0) {
+            if (!target.IsCustom()) {
+                return false;
+            }
+            u32 mip_width = target.material->width >> level;
+            u32 mip_height = target.material->height >> level;
+            if (mip_width == 0) {
+                mip_width = 1;
+            }
+            if (mip_height == 0) {
+                mip_height = 1;
+            }
+            if (target.material != material &&
+                (material->format != target.custom_format || material->width != mip_width ||
+                 material->height != mip_height)) {
+                return false;
+            }
+        }
+
+        // Queuing set this flag on the old surface. Set it again for a surface that was
+        // recreated with the same guest parameters before the image is replaced.
+        target.flags |= SurfaceFlagBits::Custom;
+        // A new base material replaces the image in this slot. The previous image is sentenced
+        // and the page table keeps surface_id
+        if (!target.IsCustom() || (level == 0 && target.material != material)) {
+            const SurfaceBase old_surface{target};
             const SurfaceId old_id =
                 slot_surfaces.swap_and_insert(surface_id, runtime, old_surface, material);
-            slot_surfaces[old_id].flags &= ~SurfaceFlagBits::Registered;
+            Surface& replaced = slot_surfaces[old_id];
+            replaced.flags &= ~SurfaceFlagBits::Registered;
+            // The sentenced copy inherited the flag set above. A guest image is not custom
+            if (!replaced.IsCustom()) {
+                replaced.flags &= ~SurfaceFlagBits::Custom;
+            }
             sentenced.emplace_back(old_id, runtime.GetResourceTick());
         }
-        Surface& surface = slot_surfaces[surface_id];
-        surface.UploadCustom(material, level);
+
+        // swap_and_insert can grow slot_surfaces, so the reference above may be dangling
+        Surface& custom_surface = slot_surfaces[surface_id];
+        custom_surface.UploadCustom(material, level);
         if (custom_tex_manager.SkipMipmaps()) {
-            runtime.GenerateMipmaps(surface);
+            runtime.GenerateMipmaps(custom_surface);
         }
         return true;
     };
@@ -1209,8 +1313,9 @@ bool RasterizerCache<T>::ValidateByReinterpretation(Surface& surface, SurfacePar
             return false;
         }
         const u32 res_scale = src_surface.res_scale;
-        if (res_scale > surface.res_scale) {
-            surface.ScaleUp(res_scale);
+        const u8 sample_count = src_surface.sample_count;
+        if ((res_scale > surface.res_scale) || (sample_count > surface.sample_count)) {
+            surface.ScaleUp(res_scale, sample_count);
         }
         const PAddr addr = boost::icl::lower(interval);
         const SurfaceParams copy_params = surface.FromInterval(copy_interval);
@@ -1226,17 +1331,32 @@ bool RasterizerCache<T>::ValidateByReinterpretation(Surface& surface, SurfacePar
         return runtime.Reinterpret(src_surface, surface, reinterpret);
     }
 
-    // No surfaces were found in the cache that had a matching bit-width.
-    // Before entering the slow path, check if part of the interval is owned
-    // by a gpu modified surface with a different stride than ours. This is indicative
-    // of texture aliasing by the guest, which for the vast majority of cases we don't
-    // need to validate.
-    // TODO: While this works for the vast majority of cases, in Fire Emblem: Shadows of Valentia
-    // the warping effect when running in dugeons relies on this stride reinterpretation.
-    // In the future this transformation should be properly implemented with a GPU shader.
+    bool has_invalid = false;
+    const PAddr addr = boost::icl::lower(interval);
+    const u32 size = boost::icl::length(interval);
+
+    ForEachSurfaceInRegion(addr, size, [&](auto, auto& cached_surface) {
+        if (cached_surface.pixel_format == PixelFormat::Invalid) {
+            has_invalid = true;
+            return true;
+        }
+        return false;
+    });
+
+    if (has_invalid) {
+        return false;
+    }
+
+    if (!boost::icl::contains(dirty_regions, interval)) {
+        return false;
+    }
+
     const auto it = dirty_regions.find(interval);
-    return it != dirty_regions.end() && it->second &&
-           slot_surfaces[it->second].stride != surface.stride;
+    if (it == dirty_regions.end() || !it->second) {
+        return false;
+    }
+
+    return slot_surfaces[it->second].stride != surface.stride;
 }
 
 template <class T>
@@ -1369,12 +1489,16 @@ SurfaceId RasterizerCache<T>::CreateSurface(const SurfaceParams& params,
         const u64 resource_free_tick = runtime.GetResourceFreeTick();
         // Try to find a matching texture in the deletion queue
         const auto it = std::find_if(sentenced.begin(), sentenced.end(), [&](const auto& pair) {
-            return (slot_surfaces[pair.first] == params) &&
-                   // Only recycle the texture if its resolution scale is equal or less than the
-                   // incoming texture
-                   (slot_surfaces[pair.first].res_scale <= params.res_scale) &&
-                   // Only recycle the texture if the texture runtime is completely done with it
-                   (resource_free_tick > pair.second);
+            return
+                // Only recycle the texture if:
+                // The texture-runtime is completely done with it
+                (resource_free_tick > pair.second)
+                // The surface parameters match the incoming texture
+                && (slot_surfaces[pair.first] == params)
+                // Its resolution scale is equal or less than the incoming texture
+                && (slot_surfaces[pair.first].res_scale <= params.res_scale)
+                // Its sample count is equal or less than the incoming texture
+                && (slot_surfaces[pair.first].sample_count <= params.sample_count);
         });
         // If a matching texture was found in the deletion queue, recycle it.
         if (it != sentenced.end()) {
@@ -1385,10 +1509,10 @@ SurfaceId RasterizerCache<T>::CreateSurface(const SurfaceParams& params,
         return slot_surfaces.insert(runtime, params, initial_flags);
     }();
     Surface& surface = slot_surfaces[surface_id];
-    if (params.res_scale > surface.res_scale) {
+    if ((params.res_scale > surface.res_scale) || (params.sample_count > surface.sample_count)) {
         // Texture is going to be upscaled, remove any previous framebuffer references
         RemoveFramebuffers(surface_id);
-        surface.ScaleUp(params.res_scale);
+        surface.ScaleUp(params.res_scale, params.sample_count);
     }
     surface.MarkInvalid(surface.GetInterval());
     return surface_id;

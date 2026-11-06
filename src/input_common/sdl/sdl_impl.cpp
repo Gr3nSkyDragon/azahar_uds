@@ -1,6 +1,6 @@
 // Copyright 2018-2026 Citra Emulator Project / Azahar Emulator Project
-// Licensed under GPLv2 or any later version
-// Refer to the misc/licenses/gplv2.txt file included.
+// Licensed under GPLv3 or any later version
+// Refer to the LICENSE.txt file included.
 
 #include <algorithm>
 #include <atomic>
@@ -98,6 +98,24 @@ struct _SDL_GameController {
 namespace InputCommon {
 
 namespace SDL {
+
+// Helper class that enforces a proper lock order with SDL internal joystick lock.
+class JoystickMapLock {
+public:
+    explicit JoystickMapLock(std::mutex& mutex_) : mutex{mutex_} {
+        SDL_LockJoysticks();
+        mutex.lock();
+    }
+    ~JoystickMapLock() {
+        mutex.unlock();
+        SDL_UnlockJoysticks();
+    }
+    JoystickMapLock(const JoystickMapLock&) = delete;
+    JoystickMapLock& operator=(const JoystickMapLock&) = delete;
+
+private:
+    std::mutex& mutex;
+};
 
 static std::string GetGUID(SDL_Joystick* joystick) {
     SDL_JoystickGUID guid = SDL_JoystickGetGUID(joystick);
@@ -238,7 +256,7 @@ struct SDLJoystickDeleter {
  */
 std::shared_ptr<std::vector<std::shared_ptr<SDLJoystick>>> SDLState::GetJoysticksByGUID(
     const std::string& guid) {
-    std::lock_guard lock{joystick_map_mutex};
+    JoystickMapLock lock{joystick_map_mutex};
     if (guid.empty() || guid == "0") {
         return joystick_vector;
     } else {
@@ -260,7 +278,7 @@ std::shared_ptr<std::vector<std::shared_ptr<SDLJoystick>>> SDLState::GetJoystick
  */
 std::shared_ptr<SDLJoystick> SDLState::GetSDLJoystickBySDLID(SDL_JoystickID sdl_id) {
     // rewriting this method, the old version was more fragile
-    std::lock_guard lock{joystick_map_mutex};
+    JoystickMapLock lock{joystick_map_mutex};
 
     for (auto& [guid, joystick_list] : joystick_map) {
         for (auto& joystick : *joystick_list) {
@@ -365,7 +383,7 @@ void SDLState::InitJoystick(int joystick_index) {
     }
     const std::string guid = GetGUID(sdl_joystick);
 
-    std::lock_guard lock{joystick_map_mutex};
+    JoystickMapLock lock{joystick_map_mutex};
     if (joystick_map.find(guid) == joystick_map.end()) {
         auto joystick = std::make_shared<SDLJoystick>(guid, 0, sdl_joystick, sdl_gamecontroller);
         auto vec = std::make_shared<std::vector<std::shared_ptr<SDLJoystick>>>();
@@ -450,7 +468,7 @@ void SDLState::HandleGameControllerEvent(const SDL_Event& event) {
 }
 
 void SDLState::CloseJoysticks() {
-    std::lock_guard lock{joystick_map_mutex};
+    JoystickMapLock lock{joystick_map_mutex};
     joystick_map.clear();
     joystick_vector->clear();
 }
@@ -818,7 +836,8 @@ SDLState::SDLState() {
             using namespace std::chrono_literals;
             while (initialized) {
                 SDL_PumpEvents();
-                std::this_thread::sleep_for(10ms);
+                // Pump faster if there are controllers connected to reduce missed inputs per frame.
+                std::this_thread::sleep_for(SDL_NumJoysticks() > 0 ? 1ms : 10ms);
             }
         });
     }
@@ -848,10 +867,13 @@ SDLState::~SDLState() {
 Common::ParamPackage SDLEventToButtonParamPackage(SDLState& state, const SDL_Event& event,
                                                   const bool down = false) {
     Common::ParamPackage params({{"engine", "sdl"}});
+    // we need to track if this is a press or release
     if (down) {
         params.Set("down", "1");
+    } else {
+        params.Erase("down");
     }
-    // is it safe to always use event.jhat.which here regardless of event type?
+
     auto joystick = state.GetSDLJoystickBySDLID(event.jhat.which);
     if (!joystick)
         return {};
@@ -906,20 +928,30 @@ Common::ParamPackage SDLEventToButtonParamPackage(SDLState& state, const SDL_Eve
         params.Set("guid", joystick->GetGUID());
         params.Set("hat", event.jhat.hat);
         switch (event.jhat.value) {
+        // if the received motion is up, down, left, or right
+        // then it will be marked as "down" above and we need to store which
+        // button is pressed
         case SDL_HAT_UP:
             params.Set("direction", "up");
+            joystick->current_hat_down = "up";
             break;
         case SDL_HAT_DOWN:
             params.Set("direction", "down");
+            joystick->current_hat_down = "down";
             break;
         case SDL_HAT_LEFT:
             params.Set("direction", "left");
+            joystick->current_hat_down = "left";
             break;
         case SDL_HAT_RIGHT:
             params.Set("direction", "right");
+            joystick->current_hat_down = "right";
             break;
+        // if the hat is now centered, we will interpret that as releasing
+        // the previously pressed button and clear the hat state
         case SDL_HAT_CENTERED:
-            params.Set("direction", "centered");
+            params.Set("direction", joystick->current_hat_down);
+            joystick->current_hat_down = "";
             break;
         default:
             return {};
@@ -1099,6 +1131,8 @@ public:
                 break;
             }
             case SDL_JOYHATMOTION: {
+                // send this as a pressed signal for every motion but SDL_HAT_CENTERED, which
+                // we will interpret as a release
                 return SDLEventToButtonParamPackage(state, event,
                                                     event.jhat.value != SDL_HAT_CENTERED);
                 break;
@@ -1220,6 +1254,19 @@ SDLState::Pollers SDLState::GetPollers(InputCommon::Polling::DeviceType type) {
     }
 
     return pollers;
+}
+
+void SDLState::GetSystemBatteryState(float& percentage, bool& charging) {
+    int battery_percent;
+    const SDL_PowerState power_state = SDL_GetPowerInfo(nullptr, &battery_percent);
+
+    if (battery_percent >= 0) {
+        percentage = static_cast<float>(battery_percent) / 100.0f;
+    } else {
+        percentage = 1.0f;
+    }
+
+    charging = power_state != SDL_POWERSTATE_ON_BATTERY;
 }
 
 } // namespace SDL

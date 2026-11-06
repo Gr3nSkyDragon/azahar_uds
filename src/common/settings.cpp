@@ -1,6 +1,6 @@
 // Copyright 2014-2026 Citra Emulator Project / Azahar Emulator Project
-// Licensed under GPLv2 or any later version
-// Refer to the misc/licenses/gplv2.txt file included.
+// Licensed under GPLv3 or any later version
+// Refer to the LICENSE.txt file included.
 
 #include <string_view>
 #include <utility>
@@ -104,6 +104,7 @@ void LogSettings() {
     log_setting("Renderer_ShadersAccurateMul", values.shaders_accurate_mul.GetValue());
     log_setting("Renderer_UseShaderJit", values.use_shader_jit.GetValue());
     log_setting("Renderer_UseResolutionFactor", values.resolution_factor.GetValue());
+    log_setting("Renderer_SampleCount", values.antialiasing.GetValue());
     log_setting("Renderer_UseIntegerScaling", values.use_integer_scaling.GetValue());
     log_setting("Renderer_FrameLimit", values.frame_limit.GetValue());
     log_setting("Renderer_VSyncNew", values.use_vsync.GetValue());
@@ -142,6 +143,9 @@ void LogSettings() {
     log_setting("Audio_Emulation", GetAudioEmulationName(values.audio_emulation.GetValue()));
     log_setting("Audio_OutputType", values.output_type.GetValue());
     log_setting("Audio_OutputDevice", values.output_device.GetValue());
+#ifdef ENABLE_QT
+    log_setting("Audio_BypassAudioEffects", values.bypass_audio_effects.GetValue());
+#endif
     log_setting("Audio_InputType", values.input_type.GetValue());
     log_setting("Audio_InputDevice", values.input_device.GetValue());
     log_setting("Audio_EnableAudioStretching", values.enable_audio_stretching.GetValue());
@@ -221,6 +225,7 @@ void RestoreGlobalState(bool is_powered_on) {
     values.use_vsync.SetGlobal(true);
     values.use_skip_duplicate_frames.SetGlobal(true);
     values.resolution_factor.SetGlobal(true);
+    values.antialiasing.SetGlobal(true);
     values.use_integer_scaling.SetGlobal(true);
     values.frame_limit.SetGlobal(true);
     values.texture_filter.SetGlobal(true);

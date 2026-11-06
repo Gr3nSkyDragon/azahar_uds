@@ -1,6 +1,6 @@
 // Copyright 2025-2026 Citra Emulator Project / Azahar Emulator Project
-// Licensed under GPLv2 or any later version
-// Refer to the misc/licenses/gplv2.txt file included.
+// Licensed under GPLv3 or any later version
+// Refer to the LICENSE.txt file included.
 
 package org.citra.citra_emu.display
 
@@ -17,6 +17,7 @@ import android.view.SurfaceView
 import android.view.WindowManager
 import org.citra.citra_emu.NativeLibrary
 import org.citra.citra_emu.features.settings.model.BooleanSetting
+import org.citra.citra_emu.features.settings.model.CitraSettings
 import org.citra.citra_emu.features.settings.model.IntSetting
 import org.citra.citra_emu.utils.Log
 
@@ -29,6 +30,8 @@ class SecondaryDisplay(val context: Context) : DisplayManager.DisplayListener {
 
     val availableDisplays: List<Display>
         get() = getSecondaryDisplays()
+
+    private val rejectedDisplays = mutableSetOf<Int>()
 
     init {
         vd = displayManager.createVirtualDisplay(
@@ -65,16 +68,18 @@ class SecondaryDisplay(val context: Context) : DisplayManager.DisplayListener {
                 .defaultDisplay.displayId
         }
         val displays = dm.displays
-        val presDisplays = dm.getDisplays(DisplayManager.DISPLAY_CATEGORY_PRESENTATION)
         return displays.filter {
-            val isPresentable = presDisplays.any { pd -> pd.displayId == it.displayId }
-            val isNotDefaultOrPresentable =
-                (it != null && it.displayId != Display.DEFAULT_DISPLAY) || isPresentable
+            // These flags SEEM to be the basis for what allows a presentation
+            // to work. Anything that has these flags should accept a presentation
+            // and anything that doesn't should NOT... I think.
+            val isPresentable = (it.flags and Display.FLAG_PRESENTATION) != 0 &&
+                (it.flags and Display.FLAG_PRIVATE == 0)
 
-            isNotDefaultOrPresentable &&
+            isPresentable &&
                 it.displayId != currentDisplayId &&
                 it.name != "HiddenDisplay" &&
                 it.state != Display.STATE_OFF &&
+                it.displayId !in rejectedDisplays &&
                 it.isValid
         }
     }
@@ -88,8 +93,9 @@ class SecondaryDisplay(val context: Context) : DisplayManager.DisplayListener {
         val displayToUse = if (availableDisplays.isEmpty() ||
             // Theoretically, the NONE option is no longer selectable, but
             // I am leaving this in for backwards compatibility
-            IntSetting.SECONDARY_DISPLAY_LAYOUT.int == SecondaryDisplayLayout.NONE.int ||
-            !BooleanSetting.ENABLE_SECONDARY_DISPLAY.boolean
+            CitraSettings.activeSettings.get(IntSetting.SECONDARY_DISPLAY_LAYOUT) ==
+            SecondaryDisplayLayout.NONE.int ||
+            !CitraSettings.activeSettings.get(BooleanSetting.ENABLE_SECONDARY_DISPLAY)
         ) {
             currentDisplayId = -1
             vd.display
@@ -124,10 +130,18 @@ class SecondaryDisplay(val context: Context) : DisplayManager.DisplayListener {
         // catch BadTokenException and InvalidDisplayException,
         // the display became invalid asynchronously, so we can assign to null
         // until onDisplayAdded/Removed/Changed is called and logic retriggered
-        catch (_: WindowManager.BadTokenException) {
+        catch (e: WindowManager.BadTokenException) {
+            Log.warning("Secondary display bad token: ${e.message}")
             pres = null
-        } catch (_: WindowManager.InvalidDisplayException) {
+        } catch (e: WindowManager.InvalidDisplayException) {
+            Log.warning("Secondary display rejected: ${e.message}")
             pres = null
+            // in case a rejected display is making it through the filter, add it to a list of bad
+            // displays and try again
+            if (displayToUse != vd.display) {
+                rejectedDisplays.add(displayToUse.displayId)
+                updateDisplay()
+            }
         }
     }
 
@@ -148,9 +162,11 @@ class SecondaryDisplay(val context: Context) : DisplayManager.DisplayListener {
     }
 
     override fun onDisplayRemoved(displayId: Int) {
+        rejectedDisplays.remove(displayId)
         updateDisplay()
     }
     override fun onDisplayChanged(displayId: Int) {
+        rejectedDisplays.remove(displayId)
         updateDisplay()
     }
 }
@@ -164,12 +180,10 @@ class SecondaryDisplayPresentation(
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        window?.setFlags(
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
-        )
+        val flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+            WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+            WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+        window?.setFlags(flags, flags)
 
         // Initialize SurfaceView
         surfaceView = SurfaceView(context)
@@ -194,7 +208,12 @@ class SecondaryDisplayPresentation(
             }
         })
 
-        this.surfaceView.setOnTouchListener { _, event ->
+        this.surfaceView.setOnTouchListener { view, event ->
+            // Deliver the touch events as they arrive instead of batching them to the next
+            // frame.
+            if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+                view.requestUnbufferedDispatch(event)
+            }
 
             val pointerIndex = event.actionIndex
             val pointerId = event.getPointerId(pointerIndex)

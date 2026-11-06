@@ -7,7 +7,6 @@ package org.citra.citra_emu.activities
 import android.Manifest.permission
 import android.annotation.SuppressLint
 import android.content.Intent
-import android.content.SharedPreferences
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.net.Uri
@@ -23,14 +22,12 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.net.toUri
-import androidx.core.os.BundleCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.navigation.NavOptions
 import androidx.navigation.fragment.NavHostFragment
-import androidx.preference.PreferenceManager
-import org.citra.citra_emu.CitraApplication
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import org.citra.citra_emu.NativeLibrary
 import org.citra.citra_emu.R
 import org.citra.citra_emu.camera.StillImageCameraHelper.onFilePickerResult
@@ -39,23 +36,26 @@ import org.citra.citra_emu.databinding.ActivityEmulationBinding
 import org.citra.citra_emu.dialogs.NetPlayDialog
 import org.citra.citra_emu.display.ScreenAdjustmentUtil
 import org.citra.citra_emu.display.SecondaryDisplay
-import org.citra.citra_emu.features.hotkeys.HotkeyUtility
+import org.citra.citra_emu.features.input.GamepadEventHandler
+import org.citra.citra_emu.features.input.GamepadHelper
 import org.citra.citra_emu.features.settings.model.BooleanSetting
+import org.citra.citra_emu.features.settings.model.CitraSettings
+import org.citra.citra_emu.features.settings.model.GraphicsAPI
 import org.citra.citra_emu.features.settings.model.IntSetting
-import org.citra.citra_emu.features.settings.model.SettingsViewModel
-import org.citra.citra_emu.features.settings.model.view.InputBindingSetting
+import org.citra.citra_emu.features.settings.model.TextureFilter
+import org.citra.citra_emu.features.settings.utils.SettingsFile
 import org.citra.citra_emu.fragments.EmulationFragment
 import org.citra.citra_emu.fragments.MessageDialogFragment
 import org.citra.citra_emu.model.Game
 import org.citra.citra_emu.ui.main.MainActivity
 import org.citra.citra_emu.utils.BuildUtil
 import org.citra.citra_emu.utils.CitraDirectoryUtils
-import org.citra.citra_emu.utils.ControllerMappingHelper
 import org.citra.citra_emu.utils.DirectoryInitialization
 import org.citra.citra_emu.utils.EmulationLifecycleUtil
 import org.citra.citra_emu.utils.EmulationMenuSettings
 import org.citra.citra_emu.utils.Esp32UsbLink
 import org.citra.citra_emu.utils.FileBrowserHelper
+import org.citra.citra_emu.utils.GameHelper
 import org.citra.citra_emu.utils.Log
 import org.citra.citra_emu.utils.NetPlayManager
 import org.citra.citra_emu.utils.PermissionsHandler
@@ -64,15 +64,11 @@ import org.citra.citra_emu.utils.ThemeUtil
 import org.citra.citra_emu.viewmodel.EmulationViewModel
 
 class EmulationActivity : AppCompatActivity() {
-    private val preferences: SharedPreferences
-        get() = PreferenceManager.getDefaultSharedPreferences(CitraApplication.appContext)
     var isActivityRecreated = false
-    private val emulationViewModel: EmulationViewModel by viewModels()
-    val settingsViewModel: SettingsViewModel by viewModels()
-
+    val emulationViewModel: EmulationViewModel by viewModels()
     private lateinit var binding: ActivityEmulationBinding
     private lateinit var screenAdjustmentUtil: ScreenAdjustmentUtil
-    private lateinit var hotkeyUtility: HotkeyUtility
+    private lateinit var gamepadEventHandler: GamepadEventHandler
     lateinit var secondaryDisplayManager: SecondaryDisplay
 
     private val onShutdown = Runnable {
@@ -122,9 +118,7 @@ class EmulationActivity : AppCompatActivity() {
             return
         }
 
-        settingsViewModel.settings.loadSettings()
-
-        screenAdjustmentUtil = ScreenAdjustmentUtil(this, windowManager, settingsViewModel.settings)
+        screenAdjustmentUtil = ScreenAdjustmentUtil(this, windowManager)
 
         // Block orientation until emulation is ready to prevent unneccesary
         // surface recreation until the renderer is ready.
@@ -133,28 +127,34 @@ class EmulationActivity : AppCompatActivity() {
 
         super.onCreate(savedInstanceState)
 
-        NativeLibrary.initMultiplayer()
+        isActivityRecreated = savedInstanceState != null
+        if (!isActivityRecreated) processGame = null
+
+        processGame = processGame ?: GameHelper.getGameFromIntent(this, intent)
+        val game = processGame
+
+        loadGameSettings(game)
 
         // Local wireless through an ESP32-S3 (Network settings). Registering the link is cheap and
         // lets the core find the board; the USB permission prompt only appears if it is enabled.
         Esp32UsbLink.install()
-        if (BooleanSetting.USE_ESP32_UDS.boolean) {
+        if (CitraSettings.activeSettings.get(BooleanSetting.USE_ESP32_UDS)) {
             Esp32UsbLink.ensurePermission(this)
         }
 
         secondaryDisplayManager = SecondaryDisplay(this)
         secondaryDisplayManager.updateDisplay()
 
+        NativeLibrary.initMultiplayer()
+
         binding = ActivityEmulationBinding.inflate(layoutInflater)
-        hotkeyUtility = HotkeyUtility(screenAdjustmentUtil, this)
+        gamepadEventHandler = GamepadEventHandler(screenAdjustmentUtil, this)
         setContentView(binding.root)
 
         val navHostFragment =
             supportFragmentManager.findFragmentById(R.id.fragment_container) as NavHostFragment
         val navController = navHostFragment.navController
         navController.setGraph(R.navigation.emulation_navigation, intent.extras)
-
-        isActivityRecreated = savedInstanceState != null
 
         // Set these options now so that the SurfaceView the game renders into is the right size.
         enableFullscreenImmersive()
@@ -176,25 +176,18 @@ class EmulationActivity : AppCompatActivity() {
         isEmulationRunning = true
         instance = this
 
-        val game = try {
-            intent.extras?.let { extras ->
-                BundleCompat.getParcelable(extras, "game", Game::class.java)
-            } ?: run {
-                Log.error("[EmulationActivity] Missing game data in intent extras")
-                return
-            }
-        } catch (e: Exception) {
-            Log.error("[EmulationActivity] Failed to retrieve game data: ${e.message}")
-            return
-        }
+        applyOrientationSettings() // Check for orientation settings at startup
 
-        NativeLibrary.playTimeManagerStart(game.titleId)
+        // TODO: all 3dsx homebrew will have titleId = 0, so make this use something different
+        if (game != null && game.titleId != 0L) NativeLibrary.playTimeManagerStart(game.titleId)
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-        val launchUri = getLaunchUri(intent)
-        if (launchUri != null && launchUri != Uri.EMPTY && launchUri == getLaunchUri(this.intent)) {
+        val launchUri = GameHelper.getLaunchUri(intent)
+        if (launchUri != null && launchUri != Uri.EMPTY &&
+            launchUri == GameHelper.getLaunchUri(this.intent)
+        ) {
             Log.info("[EmulationActivity] Ignoring relaunch of the running game")
             return
         }
@@ -208,12 +201,15 @@ class EmulationActivity : AppCompatActivity() {
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LOCKED
         emulationViewModel.setEmulationStarted(false)
 
-        val game = intent.extras?.let { extras ->
-            BundleCompat.getParcelable(extras, "game", Game::class.java)
-        }
-        if (game != null) {
+        processGame = GameHelper.getGameFromIntent(this, intent)
+        val game = processGame
+        loadGameSettings(game)
+
+        if (game != null && game.titleId != 0L) {
             NativeLibrary.playTimeManagerStart(game.titleId)
         }
+
+        enableFullscreenImmersive()
 
         val navHostFragment =
             supportFragmentManager.findFragmentById(R.id.fragment_container) as NavHostFragment
@@ -222,19 +218,62 @@ class EmulationActivity : AppCompatActivity() {
             intent.extras,
             NavOptions.Builder().setPopUpTo(R.id.emulationFragment, true).build()
         )
+        isEmulationRunning = true
+        instance = this
     }
 
-    private fun getLaunchUri(intent: Intent): Uri? = try {
-        val game = intent.extras?.let { extras ->
-            BundleCompat.getParcelable(extras, "game", Game::class.java)
+    private fun loadGameSettings(game: Game?) {
+        if (!CitraSettings.defaultsSynced) {
+            CitraSettings.syncDefaultsToNative()
+            NativeLibrary.reloadSettings()
         }
-        if (game != null) {
-            game.launchIntent.data
+
+        // load global settings from file if this is a fresh launch from a launcher
+        if (CitraSettings.activeSettings.getAllGlobal().isEmpty()) {
+            SettingsFile.loadGlobalSettings(CitraSettings.activeSettings)
+        }
+        val gameId = if (game == null ||
+            game.titleId == 0L
+        ) {
+            null
         } else {
-            intent.data ?: intent.getStringExtra("SelectedGame")?.toUri()
+            String.format("%016X", game.titleId)
         }
-    } catch (e: Exception) {
-        null
+
+        // if activeSettings already matches our current game, skip this
+        if (CitraSettings.activeSettings.gameId != gameId) {
+            CitraSettings.activeSettings.changeToGlobalContext()
+            GamepadHelper.migrateGamepadSharedPrefsToActiveSettings()
+            if (gameId != null) {
+                CitraSettings.activeSettings.gameId = gameId
+                SettingsFile.loadCustomSettings(
+                    CitraSettings.activeSettings,
+                    gameId
+                )
+            }
+        }
+
+        if (CitraSettings.activeSettings.get(IntSetting.GRAPHICS_API) == GraphicsAPI.VULKAN.int &&
+            CitraSettings.activeSettings.get(IntSetting.TEXTURE_FILTER) == TextureFilter.ANIME4K.int
+        ) {
+            if (CitraSettings.activeSettings.hasOverride(IntSetting.GRAPHICS_API)) {
+                // in this case vulkan is a per-app override, so update the per-app setting
+                // which will happen because the settings context is per-app at this point.
+                CitraSettings.activeSettings.setBySettingsContext(
+                    IntSetting.TEXTURE_FILTER,
+                    TextureFilter.NOFILTER.int
+                )
+            } else {
+                // otherwise write global if texture filter is global, override if override
+                CitraSettings.activeSettings.setByCurrentState(
+                    IntSetting.TEXTURE_FILTER,
+                    TextureFilter.NOFILTER.int
+                )
+            }
+            SettingsFile.saveSetting(IntSetting.TEXTURE_FILTER, CitraSettings.activeSettings)
+            NativeLibrary.reloadSettings()
+            showAnime4kDialog()
+        }
     }
 
     // On some devices, the system bars will not disappear on first boot or after some
@@ -258,6 +297,11 @@ class EmulationActivity : AppCompatActivity() {
     override fun onStop() {
         secondaryDisplayManager.releasePresentation()
         super.onStop()
+    }
+
+    override fun onPause() {
+        gamepadEventHandler.reset()
+        super.onPause()
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
@@ -292,6 +336,12 @@ class EmulationActivity : AppCompatActivity() {
         instance = null
         secondaryDisplayManager.releasePresentation()
         secondaryDisplayManager.releaseVD()
+
+        if (isFinishing) {
+            CitraSettings.activeSettings.changeToGlobalContext()
+            processGame = null
+            NativeLibrary.stopEmulation()
+        }
 
         super.onDestroy()
     }
@@ -361,7 +411,7 @@ class EmulationActivity : AppCompatActivity() {
         val attributes = window.attributes
 
         attributes.layoutInDisplayCutoutMode =
-            if (BooleanSetting.EXPAND_TO_CUTOUT_AREA.boolean) {
+            if (CitraSettings.activeSettings.get(BooleanSetting.EXPAND_TO_CUTOUT_AREA)) {
                 WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
             } else {
                 WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_NEVER
@@ -378,9 +428,8 @@ class EmulationActivity : AppCompatActivity() {
         }
     }
 
-    private fun applyOrientationSettings() {
-        val orientationOption = IntSetting.ORIENTATION_OPTION.int
-        screenAdjustmentUtil.changeActivityOrientation(orientationOption)
+    fun applyOrientationSettings() {
+        requestedOrientation = CitraSettings.activeSettings.get(IntSetting.ORIENTATION_OPTION)
     }
 
     // Gets button presses
@@ -404,16 +453,16 @@ class EmulationActivity : AppCompatActivity() {
 
                 if (event.keyCode == KeyEvent.KEYCODE_BACK) {
                     // If the hotkey is pressed, we don't want to open the drawer
-                    if (!hotkeyUtility.hotkeyIsPressed) {
+                    if (!gamepadEventHandler.hotkeyIsPressed) {
                         onBackPressed()
                         return true
                     }
                 }
-                return hotkeyUtility.handleKeyPress(event)
+                return gamepadEventHandler.handleKeyPress(event)
             }
 
             KeyEvent.ACTION_UP -> {
-                return hotkeyUtility.handleKeyRelease(event)
+                return gamepadEventHandler.handleKeyRelease(event)
             }
 
             else -> {
@@ -442,214 +491,16 @@ class EmulationActivity : AppCompatActivity() {
             return super.dispatchGenericMotionEvent(event)
         }
 
-        // Don't attempt to do anything if we are disconnecting a device.
-        if (event.actionMasked == MotionEvent.ACTION_CANCEL) {
-            return true
-        }
-        val input = event.device
-        val motions = input.motionRanges
-        val axisValuesCirclePad = floatArrayOf(0.0f, 0.0f)
-        val axisValuesCStick = floatArrayOf(0.0f, 0.0f)
-        val axisValuesDPad = floatArrayOf(0.0f, 0.0f)
-        var isTriggerPressedLMapped = false
-        var isTriggerPressedRMapped = false
-        var isTriggerPressedZLMapped = false
-        var isTriggerPressedZRMapped = false
-        var isTriggerPressedL = false
-        var isTriggerPressedR = false
-        var isTriggerPressedZL = false
-        var isTriggerPressedZR = false
-        for (range in motions) {
-            val axis = range.axis
-            val origValue = event.getAxisValue(axis)
-            var value = ControllerMappingHelper.scaleAxis(input, axis, origValue)
-            val nextMapping =
-                preferences.getInt(InputBindingSetting.getInputAxisButtonKey(axis), -1)
-            val guestOrientation =
-                preferences.getInt(InputBindingSetting.getInputAxisOrientationKey(axis), -1)
-            val inverted = preferences.getBoolean(
-                InputBindingSetting.getInputAxisInvertedKey(axis),
-                false
-            )
-            if (nextMapping == -1 || guestOrientation == -1) {
-                // Axis is unmapped
-                continue
-            }
-            if ((value > 0f && value < 0.1f) || (value < 0f && value > -0.1f)) {
-                // Skip joystick wobble
-                value = 0f
-            }
-            if (inverted) value = -value
+        return gamepadEventHandler.handleMotionEvent(event)
+    }
 
-            when (nextMapping) {
-                NativeLibrary.ButtonType.STICK_LEFT -> {
-                    axisValuesCirclePad[guestOrientation] = value
-                }
-
-                NativeLibrary.ButtonType.STICK_C -> {
-                    axisValuesCStick[guestOrientation] = value
-                }
-
-                NativeLibrary.ButtonType.DPAD -> {
-                    axisValuesDPad[guestOrientation] = value
-                }
-
-                NativeLibrary.ButtonType.TRIGGER_L -> {
-                    isTriggerPressedLMapped = true
-                    isTriggerPressedL = value != 0f
-                }
-
-                NativeLibrary.ButtonType.TRIGGER_R -> {
-                    isTriggerPressedRMapped = true
-                    isTriggerPressedR = value != 0f
-                }
-
-                NativeLibrary.ButtonType.BUTTON_ZL -> {
-                    isTriggerPressedZLMapped = true
-                    isTriggerPressedZL = value != 0f
-                }
-
-                NativeLibrary.ButtonType.BUTTON_ZR -> {
-                    isTriggerPressedZRMapped = true
-                    isTriggerPressedZR = value != 0f
-                }
-            }
-        }
-
-        // Circle-Pad and C-Stick status
-        NativeLibrary.onGamePadMoveEvent(
-            input.descriptor,
-            NativeLibrary.ButtonType.STICK_LEFT,
-            axisValuesCirclePad[0],
-            axisValuesCirclePad[1]
-        )
-        NativeLibrary.onGamePadMoveEvent(
-            input.descriptor,
-            NativeLibrary.ButtonType.STICK_C,
-            axisValuesCStick[0],
-            axisValuesCStick[1]
-        )
-
-        // Triggers L/R and ZL/ZR
-        if (isTriggerPressedLMapped) {
-            NativeLibrary.onGamePadEvent(
-                NativeLibrary.TOUCHSCREEN_DEVICE,
-                NativeLibrary.ButtonType.TRIGGER_L,
-                if (isTriggerPressedL) {
-                    NativeLibrary.ButtonState.PRESSED
-                } else {
-                    NativeLibrary.ButtonState.RELEASED
-                }
-            )
-        }
-        if (isTriggerPressedRMapped) {
-            NativeLibrary.onGamePadEvent(
-                NativeLibrary.TOUCHSCREEN_DEVICE,
-                NativeLibrary.ButtonType.TRIGGER_R,
-                if (isTriggerPressedR) {
-                    NativeLibrary.ButtonState.PRESSED
-                } else {
-                    NativeLibrary.ButtonState.RELEASED
-                }
-            )
-        }
-        if (isTriggerPressedZLMapped) {
-            NativeLibrary.onGamePadEvent(
-                NativeLibrary.TOUCHSCREEN_DEVICE,
-                NativeLibrary.ButtonType.BUTTON_ZL,
-                if (isTriggerPressedZL) {
-                    NativeLibrary.ButtonState.PRESSED
-                } else {
-                    NativeLibrary.ButtonState.RELEASED
-                }
-            )
-        }
-        if (isTriggerPressedZRMapped) {
-            NativeLibrary.onGamePadEvent(
-                NativeLibrary.TOUCHSCREEN_DEVICE,
-                NativeLibrary.ButtonType.BUTTON_ZR,
-                if (isTriggerPressedZR) {
-                    NativeLibrary.ButtonState.PRESSED
-                } else {
-                    NativeLibrary.ButtonState.RELEASED
-                }
-            )
-        }
-
-        // Work-around to allow D-pad axis to be bound to emulated buttons
-        if (axisValuesDPad[0] == 0f) {
-            NativeLibrary.onGamePadEvent(
-                NativeLibrary.TOUCHSCREEN_DEVICE,
-                NativeLibrary.ButtonType.DPAD_LEFT,
-                NativeLibrary.ButtonState.RELEASED
-            )
-            NativeLibrary.onGamePadEvent(
-                NativeLibrary.TOUCHSCREEN_DEVICE,
-                NativeLibrary.ButtonType.DPAD_RIGHT,
-                NativeLibrary.ButtonState.RELEASED
-            )
-        }
-        if (axisValuesDPad[0] < 0f) {
-            NativeLibrary.onGamePadEvent(
-                NativeLibrary.TOUCHSCREEN_DEVICE,
-                NativeLibrary.ButtonType.DPAD_LEFT,
-                NativeLibrary.ButtonState.PRESSED
-            )
-            NativeLibrary.onGamePadEvent(
-                NativeLibrary.TOUCHSCREEN_DEVICE,
-                NativeLibrary.ButtonType.DPAD_RIGHT,
-                NativeLibrary.ButtonState.RELEASED
-            )
-        }
-        if (axisValuesDPad[0] > 0f) {
-            NativeLibrary.onGamePadEvent(
-                NativeLibrary.TOUCHSCREEN_DEVICE,
-                NativeLibrary.ButtonType.DPAD_LEFT,
-                NativeLibrary.ButtonState.RELEASED
-            )
-            NativeLibrary.onGamePadEvent(
-                NativeLibrary.TOUCHSCREEN_DEVICE,
-                NativeLibrary.ButtonType.DPAD_RIGHT,
-                NativeLibrary.ButtonState.PRESSED
-            )
-        }
-        if (axisValuesDPad[1] == 0f) {
-            NativeLibrary.onGamePadEvent(
-                NativeLibrary.TOUCHSCREEN_DEVICE,
-                NativeLibrary.ButtonType.DPAD_UP,
-                NativeLibrary.ButtonState.RELEASED
-            )
-            NativeLibrary.onGamePadEvent(
-                NativeLibrary.TOUCHSCREEN_DEVICE,
-                NativeLibrary.ButtonType.DPAD_DOWN,
-                NativeLibrary.ButtonState.RELEASED
-            )
-        }
-        if (axisValuesDPad[1] < 0f) {
-            NativeLibrary.onGamePadEvent(
-                NativeLibrary.TOUCHSCREEN_DEVICE,
-                NativeLibrary.ButtonType.DPAD_UP,
-                NativeLibrary.ButtonState.PRESSED
-            )
-            NativeLibrary.onGamePadEvent(
-                NativeLibrary.TOUCHSCREEN_DEVICE,
-                NativeLibrary.ButtonType.DPAD_DOWN,
-                NativeLibrary.ButtonState.RELEASED
-            )
-        }
-        if (axisValuesDPad[1] > 0f) {
-            NativeLibrary.onGamePadEvent(
-                NativeLibrary.TOUCHSCREEN_DEVICE,
-                NativeLibrary.ButtonType.DPAD_UP,
-                NativeLibrary.ButtonState.RELEASED
-            )
-            NativeLibrary.onGamePadEvent(
-                NativeLibrary.TOUCHSCREEN_DEVICE,
-                NativeLibrary.ButtonType.DPAD_DOWN,
-                NativeLibrary.ButtonState.PRESSED
-            )
-        }
-        return true
+    fun showAnime4kDialog() {
+        MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.incompatible_texture_filter)
+            .setMessage(R.string.incompatible_texture_filter_description)
+            .setPositiveButton(android.R.string.ok, null)
+            .setCancelable(false)
+            .show()
     }
 
     val openAmiiboFileLauncher =
@@ -680,7 +531,7 @@ class EmulationActivity : AppCompatActivity() {
 
     companion object {
         private var instance: EmulationActivity? = null
-
+        var processGame: Game? = null
         fun isRunning(): Boolean = instance?.isEmulationRunning ?: false
     }
 }

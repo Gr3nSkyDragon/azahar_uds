@@ -101,6 +101,7 @@ const std::vector<UISettings::Shortcut> QtConfig::default_hotkeys{ {
      {QStringLiteral("Toggle Status Bar"),        QStringLiteral("Main Window"), {QStringLiteral("Ctrl+S"), QStringLiteral(""), Qt::ApplicationShortcut}},
      {QStringLiteral("Toggle Texture Dumping"),   QStringLiteral("Main Window"), {QStringLiteral(""),       QStringLiteral(""), Qt::ApplicationShortcut}},
      {QStringLiteral("Toggle Turbo Mode"),        QStringLiteral("Main Window"), {QStringLiteral(""),      QStringLiteral(""), Qt::ApplicationShortcut}},
+     {QStringLiteral("Turbo Mode (Hold)"),        QStringLiteral("Main Window"), {QStringLiteral(""),       QStringLiteral(""), Qt::ApplicationShortcut}},
     } };
 // clang-format on
 
@@ -303,6 +304,7 @@ void QtConfig::ReadAudioValues() {
     if (global) {
         ReadBasicSetting(Settings::values.output_type);
         ReadBasicSetting(Settings::values.output_device);
+        ReadBasicSetting(Settings::values.bypass_audio_effects);
         ReadBasicSetting(Settings::values.input_type);
         ReadBasicSetting(Settings::values.input_device);
     }
@@ -728,6 +730,7 @@ void QtConfig::ReadRendererValues() {
     ReadGlobalSetting(Settings::values.use_skip_duplicate_frames);
     ReadGlobalSetting(Settings::values.use_display_refresh_rate_detection);
     ReadGlobalSetting(Settings::values.resolution_factor);
+    ReadGlobalSetting(Settings::values.antialiasing);
     ReadGlobalSetting(Settings::values.use_integer_scaling);
     ReadGlobalSetting(Settings::values.frame_limit);
     ReadGlobalSetting(Settings::values.turbo_limit);
@@ -788,6 +791,9 @@ void QtConfig::ReadSystemValues() {
         ReadBasicSetting(Settings::values.init_time_offset);
         ReadBasicSetting(Settings::values.init_ticks_type);
         ReadBasicSetting(Settings::values.init_ticks_override);
+        ReadBasicSetting(Settings::values.battery_state_source);
+        ReadBasicSetting(Settings::values.battery_charging);
+        ReadBasicSetting(Settings::values.battery_level);
         ReadBasicSetting(Settings::values.steps_per_hour);
         ReadBasicSetting(Settings::values.plugin_loader_enabled);
         ReadBasicSetting(Settings::values.allow_plugin_loader);
@@ -873,6 +879,7 @@ void QtConfig::ReadUIValues() {
         ReadBasicSetting(UISettings::values.pause_when_in_background);
         ReadBasicSetting(UISettings::values.mute_when_in_background);
         ReadBasicSetting(UISettings::values.hide_mouse);
+        ReadBasicSetting(UISettings::values.use_on_screen_software_keyboard);
     }
 
     qt_config->endGroup();
@@ -966,6 +973,7 @@ void QtConfig::SaveAudioValues() {
     if (global) {
         WriteBasicSetting(Settings::values.output_type);
         WriteBasicSetting(Settings::values.output_device);
+        WriteBasicSetting(Settings::values.bypass_audio_effects);
         WriteBasicSetting(Settings::values.input_type);
         WriteBasicSetting(Settings::values.input_device);
     }
@@ -1283,6 +1291,7 @@ void QtConfig::SaveRendererValues() {
     WriteGlobalSetting(Settings::values.use_skip_duplicate_frames);
     WriteGlobalSetting(Settings::values.use_display_refresh_rate_detection);
     WriteGlobalSetting(Settings::values.resolution_factor);
+    WriteGlobalSetting(Settings::values.antialiasing);
     WriteGlobalSetting(Settings::values.use_integer_scaling);
     WriteGlobalSetting(Settings::values.frame_limit);
     WriteGlobalSetting(Settings::values.turbo_limit);
@@ -1343,6 +1352,9 @@ void QtConfig::SaveSystemValues() {
         WriteBasicSetting(Settings::values.init_time_offset);
         WriteBasicSetting(Settings::values.init_ticks_type);
         WriteBasicSetting(Settings::values.init_ticks_override);
+        WriteBasicSetting(Settings::values.battery_state_source);
+        WriteBasicSetting(Settings::values.battery_charging);
+        WriteBasicSetting(Settings::values.battery_level);
         WriteBasicSetting(Settings::values.steps_per_hour);
         WriteBasicSetting(Settings::values.plugin_loader_enabled);
         WriteBasicSetting(Settings::values.allow_plugin_loader);
@@ -1411,6 +1423,7 @@ void QtConfig::SaveUIValues() {
         WriteBasicSetting(UISettings::values.pause_when_in_background);
         WriteBasicSetting(UISettings::values.mute_when_in_background);
         WriteBasicSetting(UISettings::values.hide_mouse);
+        WriteBasicSetting(UISettings::values.use_on_screen_software_keyboard);
     }
 
     qt_config->endGroup();
