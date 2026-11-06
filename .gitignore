@@ -64,3 +64,5 @@ GIT-TAG
 
 # verify-release.sh downloads
 verify/
+# Stray compiler output from one-off builds in the repo root
+/*.obj
