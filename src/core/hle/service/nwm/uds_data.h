@@ -108,13 +108,19 @@ struct EAPoLStartPacket {
 static_assert(sizeof(EAPoLStartPacket) == 0x30, "EAPoLStartPacket has the wrong size");
 
 constexpr u16 EAPoLLogoffMagic = 0x202;
+constexpr u8 EAPoLLogoffHostStatus = 0x06; // what retail hosts put in EAPoLLogoffPacket::host_status
 
 struct EAPoLLogoffPacket {
     u16_be magic = EAPoLLogoffMagic;
     INSERT_PADDING_BYTES(2);
     u16_be assigned_node_id;
     MacAddress client_mac_address;
-    INSERT_PADDING_BYTES(6);
+    INSERT_PADDING_BYTES(2);
+    // Retail hosts (Pokemon X/Y and Sun/Moon alike) send 0x06 here, the value of
+    // NetworkStatus::ConnectedAsHost. X/Y accept a logoff with 0; Sun/Moon's joiner leaves at once
+    // (deauthentication reason 3) when it gets one.
+    u8 host_status;
+    INSERT_PADDING_BYTES(3);
     u8 connected_nodes;
     u8 max_nodes;
     INSERT_PADDING_BYTES(4);

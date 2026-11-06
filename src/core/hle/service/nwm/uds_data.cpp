@@ -361,6 +361,7 @@ std::vector<u8> GenerateEAPoLLogoffFrame(const MacAddress& mac_address, u16 netw
     EAPoLLogoffPacket eapol_logoff{};
     eapol_logoff.assigned_node_id = network_node_id;
     eapol_logoff.client_mac_address = mac_address;
+    eapol_logoff.host_status = EAPoLLogoffHostStatus;
     eapol_logoff.connected_nodes = total_nodes;
     eapol_logoff.max_nodes = max_nodes;
 
