@@ -225,6 +225,11 @@ if (ENABLE_ROOM_STANDALONE)
     add_subdirectory(citra_room_standalone)
 endif()
 
+# Stand-in for the ESP32 board and the air between emulators, for UDS tests without hardware.
+if (NOT ANDROID AND NOT ENABLE_LIBRETRO)
+    add_subdirectory(virtual_air)
+endif()
+
 if (ANDROID AND NOT ENABLE_LIBRETRO)
     add_subdirectory(android/app/src/main/jni)
     target_include_directories(citra-android PRIVATE android/app/src/main)

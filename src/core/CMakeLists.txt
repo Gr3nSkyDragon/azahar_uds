@@ -404,8 +404,6 @@ add_library(citra_core STATIC EXCLUDE_FROM_ALL
     hle/service/nwm/uds_real/esp32_probe.h
     hle/service/nwm/uds_real/esp32_serial.cpp
     hle/service/nwm/uds_real/esp32_serial.h
-    hle/service/nwm/uds_real/esp32_wire.cpp
-    hle/service/nwm/uds_real/esp32_wire.h
     hle/service/nwm/uds_real/generic_netlink.cpp
     hle/service/nwm/uds_real/generic_netlink.h
     hle/service/nwm/uds_real/ldnd_connection.cpp
@@ -527,11 +525,22 @@ endif()
 
 create_target_directory_groups(citra_core)
 
+# The ESP32 wire format and the virtual air and board (virtual_air.h). They use nothing else from
+# the core, so the standalone azahar-virtual-air server links them without the emulator.
+add_library(uds_virtual_air STATIC
+    hle/service/nwm/uds_real/esp32_wire.cpp
+    hle/service/nwm/uds_real/esp32_wire.h
+    hle/service/nwm/uds_real/virtual_air.cpp
+    hle/service/nwm/uds_real/virtual_air.h
+)
+target_link_libraries(uds_virtual_air PUBLIC citra_common)
+target_link_libraries(citra_core PUBLIC uds_virtual_air)
+
 target_link_libraries(citra_core PUBLIC citra_common PRIVATE audio_core network video_core input_common)
 target_link_libraries(citra_core PRIVATE Boost::boost Boost::serialization Boost::iostreams httplib)
 if (WIN32)
-    # Finding the ESP32's COM port (hle/service/nwm/uds_real/esp32_serial.cpp).
-    target_link_libraries(citra_core PRIVATE setupapi)
+    # Finding the ESP32's COM port, and the virtual board over TCP (hle/service/nwm/uds_real/esp32_serial.cpp).
+    target_link_libraries(citra_core PRIVATE setupapi ws2_32)
 endif()
 target_link_libraries(citra_core PUBLIC dds-ktx PRIVATE cryptopp fmt lodepng open_source_archives)
 
